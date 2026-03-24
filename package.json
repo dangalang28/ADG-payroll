@@ -10,6 +10,17 @@
   "dependencies": {
     "next": "^14.2.0",
     "react": "^18.3.0",
-    "react-dom": "^18.3.0"
+    "react-dom": "^18.3.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   }
 }
+```
+
+**File 2: `app/components/ADGPayrollDashboard.js`** — find this line (it's inside the `parseFile` function, around the Excel parsing section):
+```
+const XLSX=await import("https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs");
+```
+
+Replace it with:
+```
+const XLSX=await import("xlsx");
