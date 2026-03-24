@@ -110,7 +110,7 @@ export default function ADGPayrollDashboard(){
       headers=lines[0].split(delim).map(h=>h.trim().replace(/^["']|["']$/g,""));
       rawRows=lines.slice(1).map(line=>{const vals=[];let inQ=false,cur="";for(const ch of line){if(ch==='"')inQ=!inQ;else if(ch===delim[0]&&!inQ){vals.push(cur.trim());cur="";}else cur+=ch;}vals.push(cur.trim());return vals;});
     }else if(ext==="xlsx"||ext==="xls"){
-      try{const XLSX=await import("https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs");const buf=await file.arrayBuffer();const wb=XLSX.read(buf,{type:"array"});const ws=wb.Sheets[wb.SheetNames[0]];const data=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});if(data.length<2)return{error:"No data rows."};headers=data[0].map(h=>String(h).trim());rawRows=data.slice(1).map(r=>r.map(v=>String(v??"").trim()));}catch(e){return{error:"Failed to parse Excel: "+e.message};}
+      try{const XLSX=await import("xlsx");const buf=await file.arrayBuffer();const wb=XLSX.read(buf,{type:"array"});const ws=wb.Sheets[wb.SheetNames[0]];const data=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});if(data.length<2)return{error:"No data rows."};headers=data[0].map(h=>String(h).trim());rawRows=data.slice(1).map(r=>r.map(v=>String(v??"").trim()));}catch(e){return{error:"Failed to parse Excel: "+e.message};}
     }else return{error:"Unsupported: ."+ext+". Use .csv .txt .xlsx .xls"};
     const mapping={};const unmapped=[];
     headers.forEach((h,i)=>{const key=matchCol(h,COL_ALIASES);if(key)mapping[i]=key;else unmapped.push({index:i,header:h});});
