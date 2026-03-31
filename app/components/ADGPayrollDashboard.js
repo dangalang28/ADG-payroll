@@ -1,10 +1,19 @@
 "use client";
-import { useState, useCallback, useRef, useMemo } from "react";
+import { useState, useCallback, useRef, useMemo, useEffect } from "react";
+import { detectClient, parseKingAerospace, parseBombardier, parseRedOak } from "../lib/clientParsers";
+import { extractPDFText } from "../lib/pdfExtractor";
+
+const STORAGE_KEY = "adg_payroll_v2";
 
 const DEFAULT_CONFIG = {
-  companyId: "70157401", payComponentREG: "Hourly", payComponentOT: "Overtime reg amt",
-  payComponentPerDiem: "Per Diem Non Tax", targetMargin: 0.30,
-  weekEnding: new Date().toISOString().split("T")[0], otThreshold: 40,
+  companyId: "70157401",
+  payComponentREG: "Hourly",
+  payComponentOT: "Overtime reg amt",
+  payComponentDT: "Double Time",
+  payComponentPerDiem: "Per Diem Non Tax",
+  targetMargin: 0.30,
+  weekEnding: new Date().toISOString().split("T")[0],
+  otThreshold: 40,
 };
 
 const RATE_CARD = [
@@ -21,13 +30,23 @@ const RATE_CARD = [
 ];
 
 const DEFAULT_CONTRACTORS = [
-  "Ariza, Roberto","Blanco, Jerson","Bonilla, Fernando","Centeno Lafaurie, Oscar Jose",
-  "Chan, Allan","Cordova, Marco","Coronado, Christian","Cortes, Gustavo","Donado, Delmar",
-  "Edwards, Renado","Fanney, Dominique","Goosetree, Donald","Hoang, Dianna","Huffman, Ginger",
-  "Hurtado, Daniel","Lemons, Dinah","McCarrell, Stacy","Olaya, Jhon","Ortiz, Nelson",
-  "Pujols, Ariam","Rabeiro, Osmel","Ramsey, Bryson","Reyes, Mario","Schofield, Liam",
-  "Tran, Tuan","Williams, Gemel","Zabala, Arbenys",
-].map(name => ({ name, workerId:"", client:"", location:"", jobTitle:"A&P Mechanic", payREG:0, payOT:0, billREG:51, billOT:61, perDiemDefault:0, active:true }));
+  // Red Oak (Qarbon) — bill rates from their Excel file
+  { name:"Edwards, Renado",  workerId:"500569", client:"Red Oak", location:"", jobTitle:"A&P Mechanic", payREG:0, payOT:0, billREG:52,   billOT:78,    perDiemDefault:0, active:true },
+  { name:"Huffman, Ginger",  workerId:"500550", client:"Red Oak", location:"", jobTitle:"Bonder",       payREG:0, payOT:0, billREG:45.5, billOT:68.25, perDiemDefault:0, active:true },
+  { name:"Lemons, Dinah",    workerId:"500573", client:"Red Oak", location:"", jobTitle:"Bonder",       payREG:0, payOT:0, billREG:45.5, billOT:68.25, perDiemDefault:0, active:true },
+  // Bombardier Hartford
+  { name:"Williams, Gemel", workerId:"4000090", client:"Bombardier Hartford", location:"", jobTitle:"A&P Mechanic", payREG:0, payOT:0, billREG:0, billOT:0, perDiemDefault:0, active:true },
+  // King Aerospace
+  { name:"Grimmet, Jonnie", workerId:"", client:"King Aerospace", location:"", jobTitle:"A&P Mechanic", payREG:0, payOT:0, billREG:0, billOT:0, perDiemDefault:0, active:true },
+  // Other contractors
+  ...[
+    "Ariza, Roberto","Blanco, Jerson","Bonilla, Fernando","Centeno Lafaurie, Oscar Jose",
+    "Chan, Allan","Cordova, Marco","Coronado, Christian","Cortes, Gustavo","Donado, Delmar",
+    "Fanney, Dominique","Goosetree, Donald","Hoang, Dianna","Hurtado, Daniel",
+    "McCarrell, Stacy","Olaya, Jhon","Ortiz, Nelson","Pujols, Ariam","Rabeiro, Osmel",
+    "Ramsey, Bryson","Reyes, Mario","Schofield, Liam","Tran, Tuan","Zabala, Arbenys",
+  ].map(name => ({ name, workerId:"", client:"", location:"", jobTitle:"A&P Mechanic", payREG:0, payOT:0, billREG:0, billOT:0, perDiemDefault:0, active:true })),
+];
 
 const COL_ALIASES = {
   name:["employee name","name","worker","employee","contractor","full name","worker name","last, first","emp name","employee_name","contractor name","contractor name (standard)"],
@@ -88,6 +107,7 @@ const StatCard=({label,value,sub,color,icon})=>(<div style={{background:C.surfac
 const Input=({label,value,onChange,type="text",style:s={},placeholder,disabled})=>(<div style={{display:"flex",flexDirection:"column",gap:4,...s}}>{label&&<label style={{fontSize:11,color:C.textMuted,textTransform:"uppercase",letterSpacing:1}}>{label}</label>}<input type={type} value={value} onChange={onChange} placeholder={placeholder} disabled={disabled} style={{background:disabled?C.bg:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:6,padding:"8px 12px",color:disabled?C.textMuted:C.text,fontSize:13,outline:"none",fontFamily:"inherit"}} /></div>);
 
 export default function ADGPayrollDashboard(){
+  const[loaded,setLoaded]=useState(false);
   const[tab,setTab]=useState("dashboard");
   const[config,setConfig]=useState(DEFAULT_CONFIG);
   const[contractors,setContractors]=useState(DEFAULT_CONTRACTORS);
@@ -97,65 +117,145 @@ export default function ADGPayrollDashboard(){
   const[importPreview,setImportPreview]=useState(null);
   const[columnMapping,setColumnMapping]=useState({});
   const[parseErrors,setParseErrors]=useState([]);
+  const[lastSaved,setLastSaved]=useState(null);
 
-  const log=useCallback((action,detail)=>{setAuditLog(prev=>[{ts:new Date().toISOString(),action,detail,id:uid()},...prev.slice(0,199)]);},[]);
-
-  const parseFile=useCallback(async(file)=>{
-    const ext=file.name.split(".").pop().toLowerCase();
-    let rawRows=[],headers=[];
-    if(ext==="csv"||ext==="txt"){
-      const text=await file.text();const lines=text.split(/\r?\n/).filter(l=>l.trim());
-      if(lines.length<2)return{error:"File has no data rows."};
-      const delim=lines[0].includes("\t")?"\t":",";
-      headers=lines[0].split(delim).map(h=>h.trim().replace(/^["']|["']$/g,""));
-      rawRows=lines.slice(1).map(line=>{const vals=[];let inQ=false,cur="";for(const ch of line){if(ch==='"')inQ=!inQ;else if(ch===delim[0]&&!inQ){vals.push(cur.trim());cur="";}else cur+=ch;}vals.push(cur.trim());return vals;});
-    }else if(ext==="xlsx"||ext==="xls"){
-      try{const XLSX=await import("xlsx");const buf=await file.arrayBuffer();const wb=XLSX.read(buf,{type:"array"});const ws=wb.Sheets[wb.SheetNames[0]];const data=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});if(data.length<2)return{error:"No data rows."};headers=data[0].map(h=>String(h).trim());rawRows=data.slice(1).map(r=>r.map(v=>String(v??"").trim()));}catch(e){return{error:"Failed to parse Excel: "+e.message};}
-    }else return{error:"Unsupported: ."+ext+". Use .csv .txt .xlsx .xls"};
-    const mapping={};const unmapped=[];
-    headers.forEach((h,i)=>{const key=matchCol(h,COL_ALIASES);if(key)mapping[i]=key;else unmapped.push({index:i,header:h});});
-    const previewRows=rawRows.slice(0,200).map((vals,ri)=>{const row={};headers.forEach((h,i)=>{row["col_"+i]=vals[i]||"";});row._rowIndex=ri;return row;});
-    return{headers,mapping,unmapped,previewRows,totalRows:rawRows.length,rawRows,fileName:file.name};
+  // ── LOAD from localStorage on first render ──
+  useEffect(()=>{
+    try{
+      const saved=localStorage.getItem(STORAGE_KEY);
+      if(saved){
+        const d=JSON.parse(saved);
+        if(d.config)setConfig(p=>({...p,...d.config}));
+        if(d.contractors?.length)setContractors(d.contractors);
+        if(d.timeEntries?.length)setTimeEntries(d.timeEntries);
+        if(d.nameMap)setNameMap(d.nameMap);
+        if(d.auditLog?.length)setAuditLog(d.auditLog);
+      }
+    }catch(e){console.error("Load error",e);}
+    setLoaded(true);
   },[]);
 
-  const handleFileSelect=useCallback(async(e,source)=>{
+  // ── AUTO-SAVE to localStorage on every change ──
+  useEffect(()=>{
+    if(!loaded)return;
+    try{
+      localStorage.setItem(STORAGE_KEY,JSON.stringify({config,contractors,timeEntries,nameMap,auditLog}));
+      setLastSaved(new Date());
+    }catch(e){console.error("Save error",e);}
+  },[loaded,config,contractors,timeEntries,nameMap,auditLog]);
+
+  const log=useCallback((action,detail)=>{setAuditLog(prev=>[{ts:new Date().toISOString(),action,detail,id:uid()},...prev.slice(0,499)]);},[]);
+
+  // ── BACKUP: download full data as JSON for Teams ──
+  const exportBackup=useCallback(()=>{
+    const data={config,contractors,timeEntries,nameMap,auditLog,exportedAt:new Date().toISOString()};
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");a.href=url;
+    a.download="ADG_Payroll_Backup_"+new Date().toISOString().slice(0,10)+".json";
+    a.click();URL.revokeObjectURL(url);
+    log("BACKUP_EXPORT","Full backup downloaded");
+  },[config,contractors,timeEntries,nameMap,auditLog,log]);
+
+  // ── RESTORE: load JSON backup from Teams ──
+  const importBackup=useCallback((file)=>{
+    if(!file)return;
+    const reader=new FileReader();
+    reader.onload=(e)=>{
+      try{
+        const d=JSON.parse(e.target.result);
+        if(d.config)setConfig(p=>({...p,...d.config}));
+        if(d.contractors?.length)setContractors(d.contractors);
+        if(d.timeEntries?.length)setTimeEntries(d.timeEntries);
+        if(d.nameMap)setNameMap(d.nameMap);
+        if(d.auditLog?.length)setAuditLog(d.auditLog);
+        log("BACKUP_IMPORT","Restored from "+file.name);
+      }catch(err){alert("Could not read backup file: "+err.message);}
+    };
+    reader.readAsText(file);
+  },[log]);
+
+  // ── SMART FILE HANDLER — detects client automatically ──
+  const handleFileSelect=useCallback(async(e,forcedSource)=>{
     const file=e.target.files?.[0];if(!file)return;e.target.value="";
-    const result=await parseFile(file);
-    if(result.error){setParseErrors([result.error]);return;}
-    setImportPreview({...result,source});setColumnMapping(result.mapping);setParseErrors([]);setTab("import");
-    log("FILE_LOADED",file.name+" — "+result.totalRows+" rows, "+result.headers.length+" columns");
-  },[parseFile,log]);
+    setParseErrors([]);
+    const ext=file.name.split(".").pop().toLowerCase();
+    try{
+      if(ext==="pdf"){
+        // Parse PDF directly in the browser (no server needed)
+        const text = await extractPDFText(file);
+        const client=forcedSource||detectClient(text,file.name);
+        if(!client){setParseErrors(["Could not identify client from this PDF. Use a source button to specify."]);return;}
+        if(client==="King Aerospace"){
+          const entries=parseKingAerospace(text);
+          if(!entries.length){setParseErrors(["No timecard data found in this PDF."]);return;}
+          setImportPreview({type:"parsed",client,entries,fileName:file.name});
+        }else if(client==="Bombardier Hartford"){
+          const {entries,invoiceAmount,invoiceNumber,invoiceDate}=parseBombardier(text);
+          if(!entries.length){setParseErrors(["No employee table found in Bombardier PDF."]);return;}
+          setImportPreview({type:"bombardier",client,entries,invoiceAmount,invoiceNumber,invoiceDate,fileName:file.name});
+        }
+        setTab("import");
+        log("FILE_LOADED",file.name+" detected as "+client);
+      }else if(ext==="xlsx"||ext==="xls"){
+        const XLSX=await import("xlsx");
+        const buf=await file.arrayBuffer();
+        const wb=XLSX.read(buf,{type:"array"});
+        const ws=wb.Sheets[wb.SheetNames[0]];
+        const data=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
+        if(data.length<2){setParseErrors(["Excel file has no data rows."]);return;}
+        const headers=data[0].map(h=>String(h).trim());
+        const rows=data.slice(1).filter(r=>r.some(v=>v!==""&&v!==null));
+        const client=forcedSource||"Red Oak";
+        const entries=parseRedOak(rows,headers);
+        if(!entries.length){setParseErrors(["No valid rows found in Excel file."]);return;}
+        setImportPreview({type:"parsed",client,entries,fileName:file.name});
+        setTab("import");
+        log("FILE_LOADED",file.name+" ("+entries.length+" entries)");
+      }else{
+        setParseErrors(["Unsupported file type. Use PDF (King Aerospace / Bombardier) or XLSX (Red Oak)."]);
+      }
+    }catch(err){
+      setParseErrors(["Error reading file: "+err.message]);
+    }
+  },[log]);
 
   const confirmImport=useCallback(()=>{
-    if(!importPreview)return;const{rawRows,source}=importPreview;const map=columnMapping;
-    const colFor=(key)=>{for(const[idx,k]of Object.entries(map)){if(k===key)return parseInt(idx);}return -1;};
-    const errors=[],entries=[],seen=new Set();
-    rawRows.forEach((vals,ri)=>{
-      let name="";const ni=colFor("name"),fi=colFor("firstName"),li=colFor("lastName");
-      if(ni>=0)name=vals[ni]||"";else if(li>=0&&fi>=0)name=(vals[li]+", "+vals[fi]).trim();else if(fi>=0)name=vals[fi]||"";
-      if(!name||name===","){errors.push("Row "+(ri+2)+": No name — skipped");return;}
-      const rH=parseFloat(vals[colFor("regHours")]||0)||0,oH=parseFloat(vals[colFor("otHours")]||0)||0,pd=parseFloat(vals[colFor("perDiem")]||0)||0;
-      const rate=parseFloat(vals[colFor("payRate")]||0)||0,job=vals[colFor("jobTitle")]||"",client=vals[colFor("client")]||source||"";
-      const we=vals[colFor("weekEnding")]||config.weekEnding,wid=vals[colFor("workerId")]||"",dept=vals[colFor("department")]||"";
-      if(rH===0&&oH===0&&pd===0){errors.push("Row "+(ri+2)+": "+name+" zero hours/per diem — skipped");return;}
-      const dupKey=name+"|"+we+"|"+rH+"|"+oH+"|"+pd;
-      if(seen.has(dupKey)){errors.push("Row "+(ri+2)+": DUPLICATE "+name+" — skipped");return;}seen.add(dupKey);
-      const existDup=timeEntries.some(te=>te.importedName===name&&te.weekEnding===we&&te.regHours===rH&&te.otHours===oH&&te.perDiem===pd);
-      if(existDup){errors.push("Row "+(ri+2)+": "+name+" already exists — skipped");return;}
-      entries.push({id:uid(),weekEnding:we,source,importedName:name,regHours:rH,otHours:oH,perDiem:pd,payRate:rate,jobTitle:job,client,workerId:wid,department:dept});
-    });
-    const newMaps={...nameMap};
-    entries.forEach(e=>{
-      const exact=contractors.some(c=>c.name===e.importedName);
-      if(!exact&&!newMaps.hasOwnProperty(e.importedName)){
-        const f=fuzzyName(e.importedName,contractors);
-        newMaps[e.importedName]=f&&f.confidence>=75?f.match:"";
+    if(!importPreview)return;
+    const{entries,client}=importPreview;
+    const newEntries=[],errors=[],newMaps={...nameMap};
+    for(const entry of entries){
+      const isDup=timeEntries.some(te=>te.importedName===entry.name&&te.weekEnding===entry.weekEnding&&te.regHours===entry.regHours&&te.otHours===entry.otHours);
+      if(isDup){errors.push(entry.name+": already imported — skipped");continue;}
+      newEntries.push({
+        id:uid(),
+        weekEnding:entry.weekEnding||config.weekEnding,
+        source:client,
+        importedName:entry.name,
+        regHours:entry.regHours||0,
+        otHours:entry.otHours||0,
+        dtHours:entry.dtHours||0,
+        perDiem:entry.perDiem||0,
+        payRate:0,
+        billREG:entry.billREG||0,
+        billOT:entry.billOT||0,
+        invoiceAmount:entry.invoiceAmount||0,
+        invoiceNumber:entry.invoiceNumber||"",
+        daysWorked:entry.daysWorked||0,
+        status:entry.status||"complete",
+        workerId:"",department:"",jobTitle:"",client:"",
+      });
+      const exact=contractors.some(c=>c.name===entry.name);
+      if(!exact&&!newMaps.hasOwnProperty(entry.name)){
+        const f=fuzzyName(entry.name,contractors);
+        newMaps[entry.name]=f&&f.confidence>=75?f.match:"";
       }
-    });
-    setNameMap(newMaps);setTimeEntries(prev=>[...prev,...entries]);setParseErrors(errors);setImportPreview(null);
-    log("IMPORT_CONFIRMED",source+": "+entries.length+" added, "+errors.length+" skipped");
+    }
+    setTimeEntries(prev=>[...prev,...newEntries]);
+    setNameMap(newMaps);setParseErrors(errors);setImportPreview(null);
+    log("IMPORT_CONFIRMED",client+": "+newEntries.length+" added, "+errors.length+" skipped");
     if(errors.length===0)setTab("review");
-  },[importPreview,columnMapping,config.weekEnding,contractors,nameMap,timeEntries,log]);
+  },[importPreview,config.weekEnding,contractors,nameMap,timeEntries,log]);
 
   const normalized=useMemo(()=>timeEntries.map(e=>{
     const stdName=nameMap[e.importedName]||e.importedName;
@@ -181,8 +281,8 @@ export default function ADGPayrollDashboard(){
     const issues=[];
     weekEntries.forEach(e=>{
       if(!e.workerId)issues.push({severity:"error",name:e.stdName,msg:"Missing Paychex Worker ID — Paychex will reject this row"});
-      if(e.payREG===0&&e.regHrs>0)issues.push({severity:"error",name:e.stdName,msg:"REG pay rate is $0.00 — worker won't be paid for regular hours"});
-      if(e.payOT===0&&e.otHrs>0)issues.push({severity:"error",name:e.stdName,msg:"OT pay rate is $0.00 — worker won't be paid for overtime"});
+      if(e.payREG===0&&e.regHrs>0)issues.push({severity:"warn",name:e.stdName,msg:"REG pay rate not set — add rate in Contractors tab before exporting"});
+      if(e.payOT===0&&e.otHrs>0)issues.push({severity:"warn",name:e.stdName,msg:"OT pay rate not set — add rate in Contractors tab before exporting"});
       if(e.regHrs>config.otThreshold)issues.push({severity:"warn",name:e.stdName,msg:"REG hours ("+e.regHrs+") exceed "+config.otThreshold+"hr OT threshold — verify OT split"});
       if(e.regHrs+e.otHrs>80)issues.push({severity:"warn",name:e.stdName,msg:"Total hours ("+(e.regHrs+e.otHrs).toFixed(1)+") exceed 80 — possible duplicate"});
       if(e.otHrs>0&&e.regHrs<config.otThreshold)issues.push({severity:"warn",name:e.stdName,msg:"OT reported but REG below "+config.otThreshold+"hrs — confirm OT is legitimate"});
@@ -274,26 +374,83 @@ export default function ADGPayrollDashboard(){
   </div>);
 
   // ═══ IMPORT ═══
-  const renderImport=()=>(<div style={{display:"flex",flexDirection:"column",gap:20}}>
-    <div style={{background:C.surface,border:"2px dashed "+C.border,borderRadius:12,padding:40,textAlign:"center"}}>
-      <div style={{fontSize:36,marginBottom:12}}>{"\ud83d\udcc2"}</div>
-      <div style={{fontSize:16,fontWeight:600,color:C.text,marginBottom:6}}>Drop or browse a payroll file</div>
-      <div style={{fontSize:12,color:C.textMuted,marginBottom:20}}>Supports .csv .txt .xlsx .xls — auto-detects columns</div>
-      <div style={{display:"flex",gap:12,justifyContent:"center",flexWrap:"wrap"}}>
-        {["OneVision","RedOak","Other"].map(src=>(<label key={src} style={{...baseBtn,display:"inline-flex",alignItems:"center",gap:6,padding:"12px 24px",background:src==="OneVision"?C.accent:src==="RedOak"?C.info:C.surfaceAlt,color:src==="Other"?C.text:"#000",fontSize:13,cursor:"pointer"}}>{"\ud83d\udcc4"} {src}<input type="file" accept=".csv,.txt,.xlsx,.xls" style={{display:"none"}} onChange={e=>handleFileSelect(e,src)} /></label>))}
-      </div>
+  const renderImport=()=>{
+    const needsHours=weekEntries.filter(e=>e.status==="needs_hours");
+    return(<div style={{display:"flex",flexDirection:"column",gap:20}}>
+    {/* Client upload cards */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:16}}>
+      {/* King Aerospace */}
+      <label style={{background:C.surface,border:"2px dashed "+C.border,borderRadius:12,padding:28,textAlign:"center",cursor:"pointer",display:"block"}}>
+        <div style={{fontSize:28,marginBottom:8}}>🛩️</div>
+        <div style={{fontWeight:700,color:C.accent,marginBottom:4,fontSize:14}}>King Aerospace</div>
+        <div style={{fontSize:11,color:C.textMuted,marginBottom:12}}>Upload PDF timecard</div>
+        <div style={{background:C.accentDim,color:C.accentBright,padding:"8px 16px",borderRadius:6,fontSize:12,fontWeight:600}}>Browse PDF</div>
+        <input type="file" accept=".pdf" style={{display:"none"}} onChange={e=>handleFileSelect(e,"King Aerospace")} />
+      </label>
+      {/* Bombardier Hartford */}
+      <label style={{background:C.surface,border:"2px dashed "+C.border,borderRadius:12,padding:28,textAlign:"center",cursor:"pointer",display:"block"}}>
+        <div style={{fontSize:28,marginBottom:8}}>✈️</div>
+        <div style={{fontWeight:700,color:C.info,marginBottom:4,fontSize:14}}>Bombardier Hartford</div>
+        <div style={{fontSize:11,color:C.textMuted,marginBottom:12}}>Upload PDF invoice</div>
+        <div style={{background:C.infoDim,color:C.info,padding:"8px 16px",borderRadius:6,fontSize:12,fontWeight:600}}>Browse PDF</div>
+        <input type="file" accept=".pdf" style={{display:"none"}} onChange={e=>handleFileSelect(e,"Bombardier Hartford")} />
+      </label>
+      {/* Red Oak */}
+      <label style={{background:C.surface,border:"2px dashed "+C.border,borderRadius:12,padding:28,textAlign:"center",cursor:"pointer",display:"block"}}>
+        <div style={{fontSize:28,marginBottom:8}}>📊</div>
+        <div style={{fontWeight:700,color:C.warn,marginBottom:4,fontSize:14}}>Red Oak (Qarbon)</div>
+        <div style={{fontSize:11,color:C.textMuted,marginBottom:12}}>Upload Excel spreadsheet</div>
+        <div style={{background:C.warnDim,color:C.warn,padding:"8px 16px",borderRadius:6,fontSize:12,fontWeight:600}}>Browse Excel</div>
+        <input type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>handleFileSelect(e,"Red Oak")} />
+      </label>
     </div>
+    {/* Bombardier hours-needed alert */}
+    {needsHours.length>0&&(<div style={{background:C.warnDim,border:"1px solid "+C.warn,borderRadius:10,padding:20}}>
+      <div style={{fontWeight:700,color:C.warn,fontSize:14,marginBottom:10}}>⚠️ {needsHours.length} Bombardier {needsHours.length===1?"Entry Needs":"Entries Need"} Hours</div>
+      <p style={{fontSize:12,color:C.textDim,marginBottom:14}}>Bombardier's PDF doesn't include individual hours. Please fill in REG and OT hours for each worker below, then go to Review.</p>
+      {needsHours.map(e=>(<div key={e.id} style={{display:"flex",gap:12,alignItems:"center",marginBottom:10,flexWrap:"wrap"}}>
+        <span style={{flex:2,minWidth:160,fontWeight:600,fontSize:13}}>{e.importedName}</span>
+        <span style={{fontSize:11,color:C.textMuted}}>Days: {e.daysWorked} | WE: {e.weekEnding}</span>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <label style={{fontSize:11,color:C.textMuted}}>REG hrs</label>
+          <input type="number" step="0.5" min="0" defaultValue={0}
+            onBlur={ev=>updateEntry(e.id,"regHours",parseFloat(ev.target.value)||0)}
+            style={{width:70,background:C.surfaceAlt,border:"1px solid "+C.warn,borderRadius:4,padding:"4px 8px",color:C.text,fontSize:12,fontFamily:"inherit"}} />
+          <label style={{fontSize:11,color:C.textMuted}}>OT hrs</label>
+          <input type="number" step="0.5" min="0" defaultValue={0}
+            onBlur={ev=>updateEntry(e.id,"otHours",parseFloat(ev.target.value)||0)}
+            style={{width:70,background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:4,padding:"4px 8px",color:C.text,fontSize:12,fontFamily:"inherit"}} />
+          <button onClick={()=>updateEntry(e.id,"status","complete")} style={{...baseBtn,padding:"4px 12px",background:C.accent,color:"#000",fontSize:11}}>✓ Done</button>
+        </div>
+      </div>))}
+    </div>)}
     {importPreview&&(<div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:20}}>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-        <div><h3 style={{margin:0,color:C.accent,fontSize:14}}>Column Mapping — {importPreview.fileName}</h3><p style={{margin:"4px 0 0",fontSize:12,color:C.textMuted}}>{importPreview.totalRows} rows. Map columns below.</p></div>
-        <div style={{display:"flex",gap:8}}><button onClick={()=>setImportPreview(null)} style={{...baseBtn,padding:"8px 16px",background:C.surfaceAlt,color:C.textDim,fontSize:12}}>Cancel</button><button onClick={confirmImport} style={{...baseBtn,padding:"8px 20px",background:C.accent,color:"#000",fontSize:13}}>{"\u2713"} Confirm Import</button></div>
+        <div>
+          <h3 style={{margin:0,color:C.accent,fontSize:14}}>{importPreview.client} — {importPreview.fileName}</h3>
+          <p style={{margin:"4px 0 0",fontSize:12,color:C.textMuted}}>{importPreview.entries.length} entr{importPreview.entries.length===1?"y":"ies"} ready to import</p>
+          {importPreview.invoiceAmount>0&&<p style={{margin:"4px 0 0",fontSize:12,color:C.warn}}>Invoice #{importPreview.invoiceNumber} — ${importPreview.invoiceAmount?.toLocaleString()}</p>}
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={()=>setImportPreview(null)} style={{...baseBtn,padding:"8px 16px",background:C.surfaceAlt,color:C.textDim,fontSize:12}}>Cancel</button>
+          <button onClick={confirmImport} style={{...baseBtn,padding:"8px 20px",background:C.accent,color:"#000",fontSize:13}}>✓ Confirm Import</button>
+        </div>
       </div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:10,marginBottom:16}}>
-        {importPreview.headers.map((h,i)=>(<div key={i} style={{background:C.surfaceAlt,borderRadius:6,padding:"8px 12px"}}><div style={{fontSize:10,color:C.textMuted,marginBottom:4}}>Col {i+1}: <span style={{color:C.text}}>{h}</span></div><select value={columnMapping[i]||""} onChange={e=>{const m={...columnMapping};if(e.target.value)m[i]=e.target.value;else delete m[i];setColumnMapping(m);}} style={{width:"100%",background:C.bg,border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:columnMapping[i]?C.accent:C.textMuted,fontSize:11}}><option value="">{"\u2014"} skip {"\u2014"}</option>{Object.keys(COL_ALIASES).map(k=><option key={k} value={k}>{k}</option>)}</select></div>))}
+      <div style={{overflow:"auto",maxHeight:300}}>
+        <table style={tableStyle}><thead><tr>
+          {[["Worker Name","left"],["Week Ending","left"],["REG Hrs","right"],["OT Hrs","right"],["Bill REG","right"],["Status","left"]].map(([h,align])=><th key={h} style={{...thStyle,textAlign:align}}>{h}</th>)}
+        </tr></thead>
+        <tbody>{importPreview.entries.map((e,i)=>(
+          <tr key={i} style={{background:i%2===0?"transparent":C.surfaceAlt}}>
+            <td style={{...tdStyle,fontWeight:600}}>{e.name}</td>
+            <td style={tdStyle}>{e.weekEnding}</td>
+            <td style={{...tdStyle,textAlign:"right"}}>{e.regHours||0}</td>
+            <td style={{...tdStyle,textAlign:"right"}}>{e.otHours||0}</td>
+            <td style={{...tdStyle,textAlign:"right"}}>{e.billREG?"$"+e.billREG:"-"}</td>
+            <td style={tdStyle}>{e.status==="needs_hours"?<span style={{color:C.warn}}>⚠ Hours Needed</span>:<span style={{color:C.accent}}>✓ Ready</span>}</td>
+          </tr>
+        ))}</tbody></table>
       </div>
-      <div style={{overflow:"auto",maxHeight:300}}><table style={tableStyle}><thead><tr>{importPreview.headers.map((h,i)=><th key={i} style={{...thStyle,color:columnMapping[i]?C.accent:C.textMuted,fontSize:9}}>{columnMapping[i]?"\u2713 "+columnMapping[i]:h}</th>)}</tr></thead><tbody>
-        {importPreview.previewRows.slice(0,10).map((r,ri)=>(<tr key={ri}>{importPreview.headers.map((h,i)=><td key={i} style={{...tdStyle,fontSize:11,maxWidth:150,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{r["col_"+i]}</td>)}</tr>))}
-      </tbody></table></div>
     </div>)}
     {parseErrors.length>0&&(<div style={{background:C.surface,border:"1px solid "+C.warn,borderRadius:10,padding:16}}><h4 style={{margin:"0 0 8px",color:C.warn,fontSize:13}}>Import Notes ({parseErrors.length})</h4><div style={{maxHeight:200,overflow:"auto"}}>{parseErrors.map((e,i)=><div key={i} style={{fontSize:11,color:C.textDim,padding:"2px 0"}}>{e}</div>)}</div></div>)}
     <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:20}}>
@@ -307,6 +464,7 @@ export default function ADGPayrollDashboard(){
       </div>
     </div>
   </div>);
+  };
 
   // ═══ REVIEW ═══
   const renderReview=()=>(<div style={{display:"flex",flexDirection:"column",gap:16}}>
@@ -316,24 +474,26 @@ export default function ADGPayrollDashboard(){
     </div>)}
     <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:10,overflow:"auto",maxHeight:600}}>
       {weekEntries.length===0?(<div style={{padding:40,textAlign:"center",color:C.textMuted}}>No entries for {config.weekEnding}.</div>):(
-      <table style={tableStyle}><thead><tr>{["","Name","Worker ID","Client","Job Title","REG Hrs","OT Hrs","Per Diem","Pay Total","Bill Total",""].map(h=><th key={h} style={thStyle}>{h}</th>)}</tr></thead><tbody>
+      <table style={tableStyle}><thead><tr>
+        {[["","center"],["Name","left"],["Worker ID","left"],["Client","left"],["Job Title","left"],["REG Hrs","right"],["OT Hrs","right"],["Per Diem","right"],["Pay Total","right"],["Bill Total","right"],["","left"]].map(([h,align],i)=><th key={i} style={{...thStyle,textAlign:align}}>{h}</th>)}
+      </tr></thead><tbody>
         {weekEntries.map((e,i)=>{const hasErr=errs.some(er=>er.name===e.stdName||er.name===e.importedName);const hasWarn=warns.some(w=>w.name===e.stdName||w.name===e.importedName);
           return(<tr key={e.id} style={{background:hasErr?C.dangerDim+"33":hasWarn?C.warnDim+"33":i%2===0?"transparent":C.surfaceAlt}}>
             <td style={{...tdStyle,width:24,textAlign:"center"}}>{hasErr?<span style={{color:C.danger}}>{"\u26d4"}</span>:hasWarn?<span style={{color:C.warn}}>{"\u26a0"}</span>:<span style={{color:C.accent}}>{"\u2713"}</span>}</td>
             <td style={{...tdStyle,fontWeight:600,minWidth:160}}>{e.stdName}{e.stdName!==e.importedName&&<div style={{fontSize:10,color:C.textMuted}}>{"\u2190"} {e.importedName}</div>}</td>
             <td style={tdStyle}><input value={e.workerId} onChange={ev=>updateEntry(e.id,"workerId",ev.target.value)} style={{background:"transparent",border:"1px solid "+(!e.workerId?C.danger:C.border),borderRadius:4,padding:"4px 6px",color:C.text,width:80,fontSize:11,fontFamily:"inherit"}} placeholder="Required" /></td>
             <td style={{...tdStyle,fontSize:11}}>{e.client}</td><td style={{...tdStyle,fontSize:11}}>{e.jobTitle}</td>
-            <td style={tdStyle}><input type="number" step="0.5" value={e.regHours} onChange={ev=>updateEntry(e.id,"regHours",parseFloat(ev.target.value)||0)} style={{background:"transparent",border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,width:60,fontSize:11,fontFamily:"inherit",textAlign:"right"}} /></td>
-            <td style={tdStyle}><input type="number" step="0.5" value={e.otHours} onChange={ev=>updateEntry(e.id,"otHours",parseFloat(ev.target.value)||0)} style={{background:"transparent",border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,width:60,fontSize:11,fontFamily:"inherit",textAlign:"right"}} /></td>
-            <td style={tdStyle}><input type="number" step="1" value={e.perDiem} onChange={ev=>updateEntry(e.id,"perDiem",parseFloat(ev.target.value)||0)} style={{background:"transparent",border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,width:70,fontSize:11,fontFamily:"inherit",textAlign:"right"}} /></td>
+            <td style={{...tdStyle,textAlign:"right"}}><input type="number" step="0.5" value={e.regHours} onChange={ev=>updateEntry(e.id,"regHours",parseFloat(ev.target.value)||0)} style={{background:"transparent",border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,width:60,fontSize:11,fontFamily:"inherit",textAlign:"right"}} /></td>
+            <td style={{...tdStyle,textAlign:"right"}}><input type="number" step="0.5" value={e.otHours} onChange={ev=>updateEntry(e.id,"otHours",parseFloat(ev.target.value)||0)} style={{background:"transparent",border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,width:60,fontSize:11,fontFamily:"inherit",textAlign:"right"}} /></td>
+            <td style={{...tdStyle,textAlign:"right"}}><input type="number" step="1" value={e.perDiem} onChange={ev=>updateEntry(e.id,"perDiem",parseFloat(ev.target.value)||0)} style={{background:"transparent",border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,width:70,fontSize:11,fontFamily:"inherit",textAlign:"right"}} /></td>
             <td style={{...tdStyle,textAlign:"right",color:C.info,fontWeight:600}}>{fmt(e.payrollTotal)}</td>
             <td style={{...tdStyle,textAlign:"right",color:C.accent,fontWeight:600}}>{fmt(e.billingTotal)}</td>
             <td style={tdStyle}><button onClick={()=>deleteEntry(e.id)} style={{...baseBtn,padding:"3px 8px",background:"transparent",color:C.danger,fontSize:11}}>{"\u2715"}</button></td>
           </tr>);})}
         <tr style={{background:C.headerBg}}><td style={tdStyle}></td><td colSpan={4} style={{...tdStyle,fontWeight:700,color:C.accent}}>TOTALS ({weekEntries.length} workers)</td>
-          <td style={{...tdStyle,textAlign:"right",fontWeight:700}}>{weekEntries.reduce((s,e)=>s+e.regHrs,0).toFixed(2)}</td>
-          <td style={{...tdStyle,textAlign:"right",fontWeight:700}}>{weekEntries.reduce((s,e)=>s+e.otHrs,0).toFixed(2)}</td>
-          <td style={{...tdStyle,textAlign:"right",fontWeight:700}}>{fmt(weekEntries.reduce((s,e)=>s+e.perDiem,0))}</td>
+          <td style={{...tdStyle,textAlign:"right",fontWeight:700}}>{weekEntries.reduce((s,e)=>s+(e.regHours||0),0).toFixed(2)}</td>
+          <td style={{...tdStyle,textAlign:"right",fontWeight:700}}>{weekEntries.reduce((s,e)=>s+(e.otHours||0),0).toFixed(2)}</td>
+          <td style={{...tdStyle,textAlign:"right",fontWeight:700}}>{fmt(weekEntries.reduce((s,e)=>s+(e.perDiem||0),0))}</td>
           <td style={{...tdStyle,textAlign:"right",fontWeight:700,color:C.info}}>{fmt(weekPayroll)}</td>
           <td style={{...tdStyle,textAlign:"right",fontWeight:700,color:C.accent}}>{fmt(weekBilling)}</td><td style={tdStyle}></td></tr>
       </tbody></table>)}
@@ -356,21 +516,77 @@ export default function ADGPayrollDashboard(){
   </div>);};
 
   // ═══ CONTRACTORS ═══
-  const renderContractors=()=>(<div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:10,overflow:"auto",maxHeight:600}}>
-    <table style={tableStyle}><thead><tr>{["Name","Worker ID","Client","Dept","Job Title","Pay REG","Pay OT","Bill REG","Bill OT","Per Diem","Active"].map(h=><th key={h} style={thStyle}>{h}</th>)}</tr></thead><tbody>
-      {contractors.map((c,i)=>(<tr key={i} style={{background:i%2===0?"transparent":C.surfaceAlt,opacity:c.active?1:0.5}}>
-        <td style={{...tdStyle,fontWeight:600,minWidth:170}}>{c.name}</td>
-        <td style={tdStyle}><input value={c.workerId} onChange={e=>{const u=[...contractors];u[i]={...u[i],workerId:e.target.value};setContractors(u);}} style={{background:"transparent",border:"1px solid "+(!c.workerId?C.warn:C.border),borderRadius:4,padding:"4px 6px",color:C.text,width:80,fontSize:11,fontFamily:"inherit"}} placeholder="Required" /></td>
-        {["client","location"].map(f=><td key={f} style={tdStyle}><input value={c[f]} onChange={e=>{const u=[...contractors];u[i]={...u[i],[f]:e.target.value};setContractors(u);}} style={{background:"transparent",border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,width:"100%",fontSize:11,fontFamily:"inherit"}} /></td>)}
-        <td style={tdStyle}><select value={c.jobTitle} onChange={e=>{const u=[...contractors];const rc=RATE_CARD.find(r=>r.title===e.target.value);u[i]={...u[i],jobTitle:e.target.value,billREG:rc?.billREG||0,billOT:rc?.billOT||0};setContractors(u);}} style={{background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,fontSize:11}}>{RATE_CARD.map(r=><option key={r.title} value={r.title}>{r.title}</option>)}</select></td>
-        {["payREG","payOT","billREG","billOT","perDiemDefault"].map(f=><td key={f} style={tdStyle}><input type="number" step="0.01" value={c[f]} onChange={e=>{const u=[...contractors];u[i]={...u[i],[f]:parseFloat(e.target.value)||0};setContractors(u);}} style={{background:"transparent",border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,width:65,fontSize:11,fontFamily:"inherit",textAlign:"right"}} /></td>)}
-        <td style={tdStyle}><button onClick={()=>{const u=[...contractors];u[i]={...u[i],active:!u[i].active};setContractors(u);}} style={{...baseBtn,padding:"4px 10px",fontSize:11,background:c.active?C.accentDim:C.surfaceAlt,color:c.active?C.accentBright:C.textMuted}}>{c.active?"Y":"N"}</button></td>
-      </tr>))}
-    </tbody></table>
-  </div>);
+  const renderContractors=()=>{
+    const addContractor=()=>{
+      const name=prompt("Full name (Last, First):");
+      if(!name||!name.trim())return;
+      if(contractors.some(c=>c.name.toLowerCase()===name.trim().toLowerCase())){alert("A contractor with that name already exists.");return;}
+      setContractors(prev=>[...prev,{
+        name:name.trim(),workerId:"",client:"",location:"",
+        jobTitle:RATE_CARD[0]?.title||"",
+        payREG:0,payOT:0,
+        billREG:RATE_CARD[0]?.billREG||0,billOT:RATE_CARD[0]?.billOT||0,
+        perDiemDefault:0,active:true
+      }]);
+    };
+    const removeContractor=(i)=>{
+      const c=contractors[i];
+      if(!window.confirm(`Remove ${c.name} from the roster?\n\nThis will not delete their past payroll history.`))return;
+      setContractors(prev=>prev.filter((_,idx)=>idx!==i));
+    };
+    return(<div style={{display:"flex",flexDirection:"column",gap:16}}>
+      {/* Add Contractor */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <h3 style={{margin:"0 0 2px",fontSize:14,color:C.accent}}>Contractor Roster</h3>
+          <p style={{margin:0,fontSize:11,color:C.textMuted}}>{contractors.filter(c=>c.active).length} active · {contractors.filter(c=>!c.active).length} inactive</p>
+        </div>
+        <button onClick={addContractor} style={{...baseBtn,padding:"9px 20px",background:C.accent,color:"#000",fontSize:13,fontWeight:700}}>+ Add Contractor</button>
+      </div>
+      {/* Table */}
+      <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:10,overflow:"auto"}}>
+        <table style={tableStyle}><thead><tr>
+          {[["Name","left"],["Worker ID","left"],["Client","left"],["Dept","left"],["Job Title","left"],["Pay REG","right"],["Pay OT","right"],["Bill REG","right"],["Bill OT","right"],["Per Diem","right"],["Active","center"],["","center"]].map(([h,align],i)=><th key={i} style={{...thStyle,textAlign:align}}>{h}</th>)}
+        </tr></thead><tbody>
+          {contractors.map((c,i)=>(<tr key={i} style={{background:i%2===0?"transparent":C.surfaceAlt,opacity:c.active?1:0.45}}>
+            <td style={{...tdStyle,fontWeight:600,minWidth:170}}>{c.name}</td>
+            <td style={tdStyle}><input value={c.workerId} onChange={e=>{const u=[...contractors];u[i]={...u[i],workerId:e.target.value};setContractors(u);}} style={{background:"transparent",border:"1px solid "+(!c.workerId?C.warn:C.border),borderRadius:4,padding:"4px 6px",color:C.text,width:80,fontSize:11,fontFamily:"inherit"}} placeholder="Required" /></td>
+            {["client","location"].map(f=><td key={f} style={tdStyle}><input value={c[f]} onChange={e=>{const u=[...contractors];u[i]={...u[i],[f]:e.target.value};setContractors(u);}} style={{background:"transparent",border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,width:"100%",fontSize:11,fontFamily:"inherit"}} /></td>)}
+            <td style={tdStyle}><select value={c.jobTitle} onChange={e=>{const u=[...contractors];const rc=RATE_CARD.find(r=>r.title===e.target.value);u[i]={...u[i],jobTitle:e.target.value,billREG:rc?.billREG||0,billOT:rc?.billOT||0};setContractors(u);}} style={{background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,fontSize:11}}>{RATE_CARD.map(r=><option key={r.title} value={r.title}>{r.title}</option>)}</select></td>
+            {["payREG","payOT","billREG","billOT","perDiemDefault"].map(f=><td key={f} style={{...tdStyle,textAlign:"right"}}><input type="number" step="0.01" value={c[f]} onChange={e=>{const u=[...contractors];u[i]={...u[i],[f]:parseFloat(e.target.value)||0};setContractors(u);}} style={{background:"transparent",border:"1px solid "+C.border,borderRadius:4,padding:"4px 6px",color:C.text,width:65,fontSize:11,fontFamily:"inherit",textAlign:"right"}} /></td>)}
+            <td style={{...tdStyle,textAlign:"center"}}><button onClick={()=>{const u=[...contractors];u[i]={...u[i],active:!u[i].active};setContractors(u);}} style={{...baseBtn,padding:"4px 10px",fontSize:11,background:c.active?C.accentDim:C.surfaceAlt,color:c.active?C.accentBright:C.textMuted}}>{c.active?"Y":"N"}</button></td>
+            <td style={{...tdStyle,textAlign:"center"}}><button onClick={()=>removeContractor(i)} style={{...baseBtn,padding:"4px 8px",background:"transparent",color:C.danger,fontSize:13}} title="Remove contractor">✕</button></td>
+          </tr>))}
+        </tbody></table>
+      </div>
+      {contractors.length===0&&<div style={{textAlign:"center",padding:40,color:C.textMuted}}>No contractors yet. Click "+ Add Contractor" to get started.</div>}
+    </div>);
+  };
 
   // ═══ SETUP ═══
   const renderSetup=()=>(<div style={{display:"flex",flexDirection:"column",gap:24}}>
+    {/* Teams Backup / Restore */}
+    <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:24}}>
+      <h3 style={{margin:"0 0 6px",color:C.accent,fontSize:14}}>💾 Data Backup (Microsoft Teams)</h3>
+      <p style={{margin:"0 0 16px",fontSize:12,color:C.textMuted}}>Save a backup file to your Teams folder after each payroll run. Load it back to restore all history.</p>
+      <div style={{display:"flex",gap:12,flexWrap:"wrap",alignItems:"center"}}>
+        <button onClick={exportBackup} style={{...baseBtn,padding:"10px 24px",background:C.accent,color:"#000",fontSize:13}}>⬇ Save Backup to File</button>
+        <label style={{...baseBtn,padding:"10px 24px",background:C.infoDim,color:C.info,fontSize:13,cursor:"pointer",display:"inline-flex",alignItems:"center",gap:6}}>
+          ⬆ Load Backup from File
+          <input type="file" accept=".json" style={{display:"none"}} onChange={e=>{importBackup(e.target.files?.[0]);e.target.value="";}} />
+        </label>
+        {lastSaved&&<span style={{fontSize:11,color:C.textMuted}}>Auto-saved {lastSaved.toLocaleTimeString()}</span>}
+      </div>
+      <div style={{marginTop:16,paddingTop:16,borderTop:"1px solid "+C.border}}>
+        <button
+          onClick={()=>{if(window.confirm("Clear ALL payroll data? This cannot be undone.\n\nSave a backup first if you need to keep this data.")){localStorage.clear();window.location.reload();}}}
+          style={{...baseBtn,padding:"8px 20px",background:"transparent",color:C.danger,border:"1px solid "+C.danger,fontSize:12}}>
+          🗑 Clear All Data
+        </button>
+        <span style={{fontSize:11,color:C.textMuted,marginLeft:12}}>Resets everything — use before starting a fresh pay period</span>
+      </div>
+    </div>
+    {/* Paychex Settings */}
     <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:24}}>
       <h3 style={{margin:"0 0 16px",color:C.accent,fontSize:14}}>Paychex Configuration</h3>
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
@@ -378,6 +594,7 @@ export default function ADGPayrollDashboard(){
         <Input label="Company ID" value={config.companyId} onChange={e=>setConfig(p=>({...p,companyId:e.target.value}))} />
         <Input label="Pay Component REG (case-sensitive)" value={config.payComponentREG} onChange={e=>setConfig(p=>({...p,payComponentREG:e.target.value}))} />
         <Input label="Pay Component OT (case-sensitive)" value={config.payComponentOT} onChange={e=>setConfig(p=>({...p,payComponentOT:e.target.value}))} />
+        <Input label="Pay Component DT (case-sensitive)" value={config.payComponentDT||"Double Time"} onChange={e=>setConfig(p=>({...p,payComponentDT:e.target.value}))} />
         <Input label="Pay Component Per Diem (case-sensitive)" value={config.payComponentPerDiem} onChange={e=>setConfig(p=>({...p,payComponentPerDiem:e.target.value}))} />
         <Input label="Target Margin %" type="number" value={(config.targetMargin*100).toFixed(0)} onChange={e=>setConfig(p=>({...p,targetMargin:parseFloat(e.target.value)/100}))} />
         <Input label="OT Threshold (hours)" type="number" value={config.otThreshold} onChange={e=>setConfig(p=>({...p,otThreshold:parseFloat(e.target.value)||40}))} />
@@ -422,6 +639,190 @@ export default function ADGPayrollDashboard(){
     </div>))}</div>)}
   </div>);
 
+  // ═══ HELP ═══
+  const renderHelp=()=>{
+    const S={card:{background:C.surface,border:"1px solid "+C.border,borderRadius:12,padding:24,marginBottom:0},
+      h2:{margin:"0 0 4px",fontSize:16,fontWeight:700,color:C.accent},
+      h3:{margin:"0 0 12px",fontSize:13,fontWeight:700,color:C.text,textTransform:"uppercase",letterSpacing:1},
+      p:{margin:"0 0 10px",fontSize:13,color:C.textDim,lineHeight:1.6},
+      label:{fontSize:11,fontWeight:700,color:C.accent,display:"block",marginBottom:2,textTransform:"uppercase",letterSpacing:0.5},
+      field:{marginBottom:14,paddingBottom:14,borderBottom:"1px solid "+C.border},
+      step:{display:"flex",gap:16,alignItems:"flex-start",marginBottom:20},
+      stepNum:{width:36,height:36,borderRadius:"50%",background:C.accent,color:"#000",display:"flex",alignItems:"center",justifyContent:"center",fontWeight:900,fontSize:15,flexShrink:0},
+      faqQ:{fontSize:13,fontWeight:700,color:C.text,marginBottom:4},
+      faqA:{fontSize:12,color:C.textDim,lineHeight:1.65,margin:"0 0 18px"},
+      badge:{display:"inline-block",background:C.accentDim,color:C.accentBright,borderRadius:4,padding:"1px 7px",fontSize:10,fontWeight:700,marginLeft:6,verticalAlign:"middle"}};
+    return(<div style={{display:"flex",flexDirection:"column",gap:24}}>
+
+      {/* HEADER */}
+      <div style={{background:"linear-gradient(135deg,#0f2027,#203a43,#2c5364)",borderRadius:12,padding:"28px 32px",border:"1px solid "+C.border}}>
+        <div style={{fontSize:22,fontWeight:900,color:C.accent,marginBottom:6}}>ADG Payroll Dashboard — User Guide</div>
+        <p style={{...S.p,margin:0,fontSize:14}}>Built by <strong style={{color:C.accent}}>ACT (Astro Consulting & Technology)</strong> for Astro Dynamic Group. This tool replaces the manual spreadsheet process — importing client payroll files, organizing data, and exporting a Paychex-ready CSV file with one click.</p>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:24}}>
+
+        {/* QUICK START */}
+        <div style={{...S.card,gridColumn:"1/-1"}}>
+          <div style={{...S.h2,marginBottom:16}}>⚡ Quick Start — 5 Steps</div>
+          <p style={{...S.p,marginBottom:20}}>Every pay period, follow these steps in order:</p>
+          {[
+            ["1","⚙️","Setup Tab — Set the pay period","Go to Setup. Set the Week Ending date (the last day of the pay week, usually a Friday). Confirm the Company ID matches your Paychex account. You only need to do this once per week."],
+            ["2","📥","Import Tab — Upload your client files","Click each of the 3 client cards and upload the file you received that week. King Aerospace → their PDF timecard. Bombardier Hartford → their PDF invoice. Red Oak (Qarbon) → their Excel spreadsheet. The system reads each file automatically."],
+            ["3","🔗","Names Tab — Match any new names","If the system doesn't recognize a name from a file (e.g. a new hire), the Names tab will show a badge with the count. Go there and match each imported name to the correct contractor from your roster."],
+            ["4","✏️","Review Tab — Verify and correct","Check every row. Fill in any missing Worker IDs (required by Paychex). For Bombardier entries, enter the actual REG and OT hours — those aren't in their PDF. Fix any red errors before exporting."],
+            ["5","✅","Export Tab — Download the Paychex file","Once the status dot in the top-right turns green, click 'Export Paychex SPI CSV'. Upload that file directly to Paychex to process payroll. Done!"]
+          ].map(([n,icon,title,desc])=>(
+            <div key={n} style={S.step}>
+              <div style={S.stepNum}>{n}</div>
+              <div>
+                <div style={{fontWeight:700,fontSize:14,color:C.text,marginBottom:3}}>{icon} {title}</div>
+                <div style={{fontSize:12,color:C.textDim,lineHeight:1.65}}>{desc}</div>
+              </div>
+            </div>
+          ))}
+          <div style={{background:C.warnDim,borderRadius:8,padding:"12px 16px",border:"1px solid "+C.warn}}>
+            <span style={{color:C.warn,fontWeight:700,fontSize:12}}>💾 After every run:</span>
+            <span style={{fontSize:12,color:C.textDim,marginLeft:8}}>Go to Setup → click "Save Backup to File" → save it to your Microsoft Teams payroll folder. This keeps a permanent record for taxes.</span>
+          </div>
+        </div>
+
+        {/* TAB REFERENCE */}
+        <div style={S.card}>
+          <div style={{...S.h2,marginBottom:16}}>🗂 Tab-by-Tab Reference</div>
+
+          <div style={{marginBottom:20}}>
+            <div style={{fontWeight:700,color:C.accent,fontSize:13,marginBottom:8}}>📊 Dashboard</div>
+            {[["Week Ending","The current pay period date. Set it in Setup."],
+              ["Export Status","NOT READY = data is missing or has errors. READY = safe to export."],
+              ["Margin","How much profit ADG makes this week (Billing minus Payroll)."],
+              ["Weekly Payroll","Total amount ADG pays all workers this week."],
+              ["Weekly Billing","Total amount ADG charges all clients this week."],
+              ["YTD rows","Year-to-date totals — all pay periods combined since the last clear."],
+              ["Status dot (top right)","Green = ready to export. Red = errors exist."]].map(([f,d])=>(
+              <div key={f} style={S.field}><span style={S.label}>{f}</span><span style={{...S.p,margin:0}}>{d}</span></div>))}
+          </div>
+
+          <div style={{marginBottom:20}}>
+            <div style={{fontWeight:700,color:C.accent,fontSize:13,marginBottom:8}}>📥 Import</div>
+            {[["King Aerospace card","Upload the KACC Weekly Timecard Detail PDF. The system reads each worker's REG, OT, and DT hours automatically."],
+              ["Bombardier Hartford card","Upload their invoice PDF. The system reads the invoice number and worker names, but hours must be entered manually in the Review tab."],
+              ["Red Oak (Qarbon) card","Upload their weekly Excel timesheet. Hours and bill rates are read automatically."],
+              ["Quick Add (Manual)","Need to add an entry that wasn't in any file? Pick a contractor from the dropdown and type their hours here."],
+              ["Import Notes","Yellow notes appear if the system had trouble reading part of a file. Non-critical — review them but don't panic."]].map(([f,d])=>(
+              <div key={f} style={S.field}><span style={S.label}>{f}</span><span style={{...S.p,margin:0}}>{d}</span></div>))}
+          </div>
+
+          <div style={{marginBottom:20}}>
+            <div style={{fontWeight:700,color:C.accent,fontSize:13,marginBottom:8}}>🔗 Names</div>
+            {[["Name Matching","When a name from a PDF/Excel doesn't exactly match your Contractor Roster, it shows up here. Use the dropdown to tell the system who it is."],
+              ["Badge count","The red number on the Names tab = how many names still need matching. Get it to 0 before reviewing."]].map(([f,d])=>(
+              <div key={f} style={S.field}><span style={S.label}>{f}</span><span style={{...S.p,margin:0}}>{d}</span></div>))}
+          </div>
+
+          <div>
+            <div style={{fontWeight:700,color:C.accent,fontSize:13,marginBottom:8}}>📋 Audit</div>
+            <div style={S.field}><span style={S.label}>Audit Log</span><span style={{...S.p,margin:0}}>Every action — imports, edits, exports, deletes — is logged here with a timestamp. Useful for accountability and troubleshooting.</span></div>
+          </div>
+        </div>
+
+        {/* FIELD REFERENCE RIGHT COLUMN */}
+        <div style={S.card}>
+          <div style={{...S.h2,marginBottom:16}}>🗂 Tab-by-Tab Reference (continued)</div>
+
+          <div style={{marginBottom:20}}>
+            <div style={{fontWeight:700,color:C.accent,fontSize:13,marginBottom:8}}>✏️ Review</div>
+            {[["Status icon (✓/⚠/⛔)","Green check = this row is clean. Yellow = warning, okay to export but double-check. Red = must fix before Paychex will accept the file."],
+              ["Worker ID","The employee's ID number inside Paychex. Required. If blank, Paychex rejects the entire file. Find it in your Paychex account under Employees."],
+              ["Client","Which client this work was billed to (King Aerospace, Bombardier Hartford, or Red Oak)."],
+              ["Job Title","The worker's role — used to look up the correct bill rates from the Rate Card."],
+              ["REG Hrs","Regular hours worked (up to 40 hrs/week). Edit directly in this cell."],
+              ["OT Hrs","Overtime hours (over 40 hrs/week). Edit directly in this cell."],
+              ["Per Diem","Non-taxable daily meal/travel allowance paid to this worker. Enter as a dollar amount."],
+              ["Pay Total","Auto-calculated: (REG hrs × Pay REG rate) + (OT hrs × Pay OT rate) + Per Diem."],
+              ["Bill Total","Auto-calculated: (REG hrs × Bill REG rate) + (OT hrs × Bill OT rate) + Per Diem."],
+              ["✕ button","Removes this entry from the current pay period. Does not affect other weeks."],
+              ["TOTALS row","Sum of all columns across all workers. Auto-updates as you edit."]].map(([f,d])=>(
+              <div key={f} style={S.field}><span style={S.label}>{f}</span><span style={{...S.p,margin:0}}>{d}</span></div>))}
+          </div>
+
+          <div style={{marginBottom:20}}>
+            <div style={{fontWeight:700,color:C.accent,fontSize:13,marginBottom:8}}>👷 Contractors</div>
+            {[["Name","Format: Last, First. Must be consistent — spelling must match what comes from the client files, or use the Names tab to bridge the gap."],
+              ["Worker ID","Paychex employee ID. Required for export. Enter it here once and it will pre-fill every week."],
+              ["Client","Which client(s) this contractor works for. Informational only."],
+              ["Dept","Department or job site. Informational only."],
+              ["Job Title","Selecting a job title auto-fills the Bill REG and Bill OT rates from the Rate Card."],
+              ["Pay REG","The hourly wage ADG pays this worker for regular hours."],
+              ["Pay OT","The hourly wage ADG pays this worker for overtime hours (typically 1.5× Pay REG)."],
+              ["Bill REG","The hourly rate ADG charges the client for this worker's regular hours."],
+              ["Bill OT","The hourly rate ADG charges the client for overtime hours."],
+              ["Per Diem","Default daily per diem amount for this worker. Can be overridden per week in the Review tab."],
+              ["Active (Y/N)","Y = worker shows in Import dropdowns and gets processed. N = worker is hidden but their history stays."]].map(([f,d])=>(
+              <div key={f} style={S.field}><span style={S.label}>{f}</span><span style={{...S.p,margin:0}}>{d}</span></div>))}
+          </div>
+
+          <div>
+            <div style={{fontWeight:700,color:C.accent,fontSize:13,marginBottom:8}}>✅ Export</div>
+            {[["Export Paychex SPI CSV","Downloads a .csv file formatted to Paychex's SPI import spec. Upload this file to Paychex to process the week's payroll. Only enabled when there are no red errors."],
+              ["Export QB Invoice CSV","Downloads a QuickBooks-compatible invoice file showing what ADG billed each client. Optional — for internal bookkeeping."]].map(([f,d])=>(
+              <div key={f} style={S.field}><span style={S.label}>{f}</span><span style={{...S.p,margin:0}}>{d}</span></div>))}
+          </div>
+        </div>
+      </div>
+
+      {/* SETUP REFERENCE */}
+      <div style={S.card}>
+        <div style={{...S.h2,marginBottom:16}}>⚙️ Setup — Field Reference</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 32px"}}>
+          {[["Week Ending","The last day of the current pay week (usually a Friday). All imported entries are tagged to this date. Change this at the start of every new pay period."],
+            ["Company ID","Your Paychex company number. Pre-filled as 70157401. Only change if Paychex tells you otherwise."],
+            ["Pay Component REG","The exact name Paychex uses for regular pay in your account. Case-sensitive. Default: Hourly."],
+            ["Pay Component OT","The exact name Paychex uses for overtime pay. Default: Overtime reg amt."],
+            ["Pay Component DT","The name Paychex uses for double-time (King Aerospace only). Default: Double Time."],
+            ["Pay Component Per Diem","The name Paychex uses for non-taxable per diem. Default: Per Diem Non Tax."],
+            ["Target Margin %","The profit margin ADG aims for. Used to color the Margin indicator on the Dashboard: green if above target, yellow if below."],
+            ["OT Threshold (hours)","After this many REG hours in a week, the system flags OT warnings. Default is 40."],
+            ["Rate Card","Standard bill rates for each job title. Selecting a job title on a contractor auto-fills their bill rates from here."],
+            ["Save Backup to File","Downloads all your data (contractors, entries, history) as a .json file. Save this to your Microsoft Teams payroll folder for tax-record keeping."],
+            ["Load Backup from File","Restores all data from a previously saved .json backup. Use when switching computers or recovering from an accident."],
+            ["Clear All Data","Wipes the app completely. Always save a backup first. Good for starting a fresh year or fixing a corrupted session."]].map(([f,d])=>(
+            <div key={f} style={S.field}><span style={S.label}>{f}</span><span style={{...S.p,margin:0}}>{d}</span></div>))}
+        </div>
+      </div>
+
+      {/* FAQ */}
+      <div style={S.card}>
+        <div style={{...S.h2,marginBottom:20}}>❓ Frequently Asked Questions</div>
+        {[
+          ["What does this tool actually do?","It replaces the manual process of copying numbers from 3 different client payroll files into a spreadsheet. You upload the files, the system reads them, and you download one clean CSV that goes straight into Paychex. Less typing = less human error."],
+          ["Why do I need to enter hours for Bombardier employees manually?","Bombardier's PDF is an invoice — it shows how many days each employee worked and the total bill, but not the individual daily hours. ADG knows the hours separately. So the system imports everything it can from the PDF and flags those rows for you to fill in the REG/OT split."],
+          ["What is a Worker ID and where do I find it?","The Worker ID is Paychex's internal ID number for each employee. Log in to Paychex, go to Employees, and find each person. Their ID is listed on their profile page. You only need to enter it once — the system saves it forever."],
+          ["What happens if I close the browser?","Your data is safe. Everything auto-saves to your browser's local storage every time you make a change. When you come back and open the same URL, it picks right up where you left off. The auto-save timestamp in Setup confirms when it last saved."],
+          ["What is the difference between Pay Rate and Bill Rate?","Pay Rate is what ADG pays the worker. Bill Rate is what ADG charges the client. The difference is ADG's profit (margin). Example: ADG pays a tech $25/hr (Pay REG) but bills King Aerospace $35/hr (Bill REG) — ADG keeps the $10 difference."],
+          ["What is Per Diem?","A non-taxable daily allowance to cover meals and travel costs. It's paid to the worker on top of their wages but isn't subject to income tax. The amount varies by worker — enter the default in the Contractors tab, and adjust per-week in Review if needed."],
+          ["What does 'DT' mean on King Aerospace?","Double Time. California labor law requires workers to be paid 2× their regular rate after 12 hours in a single day or on the 7th consecutive day of work. King Aerospace tracks this separately and it shows up in their timecard report."],
+          ["Why is the Export button grayed out?","There's at least one red ⛔ error in the Review tab. Common causes: (1) a Worker ID is missing, or (2) a name wasn't matched in the Names tab. Fix all red errors and the button will activate."],
+          ["What's the difference between a Warning and an Error?","Errors (⛔ red) block the export — Paychex will reject the file if they're not fixed. Warnings (⚠ yellow) are flags for your review but don't block export. Example: a warning appears if REG hours exceed 40 (possible OT issue), but you can still export after you've reviewed it."],
+          ["How do I handle a new contractor who isn't in the roster yet?","Go to Contractors tab → click '+ Add Contractor' → enter their name in Last, First format. Fill in their Pay and Bill rates. Add their Worker ID from Paychex. They'll appear in the Import dropdown immediately."],
+          ["Can I use this on multiple computers?","Yes. After each payroll run, save a backup file (Setup → Save Backup to File) and store it in Teams. On the other computer, open the app → Setup → Load Backup from File. All your contractors, rates, and history will be restored."],
+          ["What if a client sends me a file in a new format?","Contact ACT. The parsers are built specifically for each client's current format. If they change their format, ACT can update the parser quickly."],
+          ["Is my data secure?","Yes. All data stays on your computer in the browser. No payroll data is ever sent to any server or third party. The PDF parsing happens directly in your browser — the file never leaves your machine."]
+        ].map(([q,a])=>(
+          <div key={q} style={{marginBottom:16,paddingBottom:16,borderBottom:"1px solid "+C.border}}>
+            <div style={S.faqQ}>Q: {q}</div>
+            <div style={S.faqA}>A: {a}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* FOOTER */}
+      <div style={{textAlign:"center",padding:"16px 0",fontSize:11,color:C.textMuted}}>
+        ADG Payroll Dashboard · Built by ACT (Astro Consulting & Technology) · Questions? Contact ACT.
+      </div>
+    </div>);
+  };
+
   // ═══ SHELL ═══
   return(<div style={{background:C.bg,minHeight:"100vh",color:C.text,fontFamily:"'JetBrains Mono','Fira Code',monospace"}}>
     <div style={{background:C.headerBg,borderBottom:"1px solid "+C.border,padding:"14px 24px",display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12}}>
@@ -441,6 +842,7 @@ export default function ADGPayrollDashboard(){
       <TabBtn id="export" label="Export" icon={"\u2705"} />
       <TabBtn id="setup" label="Setup" icon={"\u2699"} />
       <TabBtn id="audit" label="Audit" icon={"\ud83d\udccb"} />
+      <TabBtn id="help" label="Help" icon={"❓"} />
     </div>
     <div style={{padding:"20px 24px",maxWidth:1440,margin:"0 auto"}}>
       {tab==="dashboard"&&renderDashboard()}
@@ -451,6 +853,7 @@ export default function ADGPayrollDashboard(){
       {tab==="export"&&renderExport()}
       {tab==="setup"&&renderSetup()}
       {tab==="audit"&&renderAudit()}
+      {tab==="help"&&renderHelp()}
     </div>
   </div>);
 }
