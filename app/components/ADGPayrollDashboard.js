@@ -4,6 +4,7 @@ import { detectClient, parseKingAerospace, parseBombardier, parseRedOak } from "
 import { extractPDFText } from "../lib/pdfExtractor";
 
 const STORAGE_KEY = "adg_payroll_v2";
+const PROFILES_KEY  = "adg_client_profiles_v1";
 
 const DEFAULT_CONFIG = {
   companyId: "70157401",
@@ -90,6 +91,27 @@ function fuzzyName(imported, contractors) {
   return null;
 }
 
+// ── GENERIC COLUMN-MAP PARSER (for unknown client files) ──
+function applyGenericMap(rows,headers,fieldMap){
+  const entries=[];
+  for(const row of rows){
+    let name="";
+    const idx=(f)=>f?headers.indexOf(f):-1;
+    if(fieldMap.name&&idx(fieldMap.name)>=0){name=String(row[idx(fieldMap.name)]??"").trim();}
+    else if(fieldMap.firstName&&fieldMap.lastName&&idx(fieldMap.firstName)>=0&&idx(fieldMap.lastName)>=0){
+      const fn=String(row[idx(fieldMap.firstName)]??"").trim();
+      const ln=String(row[idx(fieldMap.lastName)]??"").trim();
+      name=ln?`${ln}, ${fn}`:fn;
+    }
+    if(!name)continue;
+    const getNum=(f)=>idx(f)>=0?parseFloat(row[idx(f)])||0:0;
+    const regHours=getNum(fieldMap.regHours),otHours=getNum(fieldMap.otHours),perDiem=getNum(fieldMap.perDiem);
+    if(regHours===0&&otHours===0)continue;
+    entries.push({name,regHours,otHours,perDiem,status:"complete",weekEnding:""});
+  }
+  return entries;
+}
+
 const C = {
   bg:"#0c1117",surface:"#151d27",surfaceAlt:"#1a2332",border:"#243044",
   accent:"#22c55e",accentDim:"#166534",accentBright:"#4ade80",
@@ -114,10 +136,11 @@ export default function ADGPayrollDashboard(){
   const[nameMap,setNameMap]=useState({});
   const[timeEntries,setTimeEntries]=useState([]);
   const[auditLog,setAuditLog]=useState([]);
-  const[importPreview,setImportPreview]=useState(null);
-  const[columnMapping,setColumnMapping]=useState({});
+  const[importQueue,setImportQueue]=useState([]);      // multi-file upload queue
   const[parseErrors,setParseErrors]=useState([]);
   const[lastSaved,setLastSaved]=useState(null);
+  const[clientProfiles,setClientProfiles]=useState({}); // saved generic client column maps
+  const[mappingForms,setMappingForms]=useState({});     // in-progress mapper state per item
 
   // ── LOAD from localStorage on first render ──
   useEffect(()=>{
@@ -131,6 +154,8 @@ export default function ADGPayrollDashboard(){
         if(d.nameMap)setNameMap(d.nameMap);
         if(d.auditLog?.length)setAuditLog(d.auditLog);
       }
+      const savedProfiles=localStorage.getItem(PROFILES_KEY);
+      if(savedProfiles)setClientProfiles(JSON.parse(savedProfiles));
     }catch(e){console.error("Load error",e);}
     setLoaded(true);
   },[]);
@@ -143,6 +168,12 @@ export default function ADGPayrollDashboard(){
       setLastSaved(new Date());
     }catch(e){console.error("Save error",e);}
   },[loaded,config,contractors,timeEntries,nameMap,auditLog]);
+
+  // ── SAVE client profiles when they change ──
+  useEffect(()=>{
+    if(!loaded)return;
+    try{localStorage.setItem(PROFILES_KEY,JSON.stringify(clientProfiles));}catch(e){}
+  },[loaded,clientProfiles]);
 
   const log=useCallback((action,detail)=>{setAuditLog(prev=>[{ts:new Date().toISOString(),action,detail,id:uid()},...prev.slice(0,499)]);},[]);
 
@@ -175,87 +206,128 @@ export default function ADGPayrollDashboard(){
     reader.readAsText(file);
   },[log]);
 
-  // ── SMART FILE HANDLER — detects client automatically ──
-  const handleFileSelect=useCallback(async(e,forcedSource)=>{
-    const file=e.target.files?.[0];if(!file)return;e.target.value="";
+  // ── MULTI-FILE UPLOAD HANDLER ──
+  const handleFilesSelect=useCallback(async(filesOrEvent,forcedSource)=>{
+    const rawList=filesOrEvent?.target?.files??filesOrEvent;
+    if(!rawList||rawList.length===0)return;
+    const files=Array.from(rawList); // snapshot before clearing
+    if(filesOrEvent?.target)filesOrEvent.target.value="";
     setParseErrors([]);
-    const ext=file.name.split(".").pop().toLowerCase();
-    try{
-      if(ext==="pdf"){
-        // Parse PDF directly in the browser (no server needed)
-        const text = await extractPDFText(file);
-        const client=forcedSource||detectClient(text,file.name);
-        if(!client){setParseErrors(["Could not identify client from this PDF. Use a source button to specify."]);return;}
-        if(client==="King Aerospace"){
-          const entries=parseKingAerospace(text);
-          if(!entries.length){setParseErrors(["No timecard data found in this PDF."]);return;}
-          setImportPreview({type:"parsed",client,entries,fileName:file.name});
-        }else if(client==="Bombardier Hartford"){
-          const {entries,invoiceAmount,invoiceNumber,invoiceDate}=parseBombardier(text);
-          if(!entries.length){setParseErrors(["No employee table found in Bombardier PDF."]);return;}
-          setImportPreview({type:"bombardier",client,entries,invoiceAmount,invoiceNumber,invoiceDate,fileName:file.name});
+    const fileMap={};
+    const newItems=files.map(file=>{
+      const id=uid();fileMap[id]=file;
+      return{id,fileName:file.name,status:"parsing",client:forcedSource||null,entries:[],error:null,rawHeaders:null,rawRows:null,invoiceAmount:0,invoiceNumber:"",invoiceDate:""};
+    });
+    setImportQueue(prev=>[...prev,...newItems]);
+    setTab("import");
+    for(const item of newItems){
+      const file=fileMap[item.id];
+      const ext=file.name.split(".").pop().toLowerCase();
+      try{
+        if(ext==="pdf"){
+          const text=await extractPDFText(file);
+          const client=forcedSource||detectClient(text,file.name);
+          if(!client){setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"error",error:"Could not auto-detect client. Use a client card below to force the source."}:q));continue;}
+          if(client==="King Aerospace"){
+            const entries=parseKingAerospace(text);
+            if(!entries.length){setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"error",error:"No timecard data found in this PDF."}:q));continue;}
+            setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"ready",client,entries}:q));
+          }else if(client==="Bombardier Hartford"){
+            const{entries,invoiceAmount,invoiceNumber,invoiceDate}=parseBombardier(text);
+            if(!entries.length){setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"error",error:"No employee table found in Bombardier PDF."}:q));continue;}
+            setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"ready",client,entries,invoiceAmount,invoiceNumber,invoiceDate}:q));
+          }
+          log("FILE_LOADED",file.name+" \u2192 "+client);
+        }else if(ext==="xlsx"||ext==="xls"||ext==="csv"){
+          const XLSX=await import("xlsx");
+          let data;
+          if(ext==="csv"){const text=await file.text();const wb=XLSX.read(text,{type:"string"});data=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:""});}
+          else{const buf=await file.arrayBuffer();const wb=XLSX.read(buf,{type:"array"});data=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{header:1,defval:""});}
+          if(data.length<2){setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"error",error:"File has no data rows."}:q));continue;}
+          const rawHeaders=data[0].map(h=>String(h).trim());
+          const rawRows=data.slice(1).filter(r=>r.some(v=>v!==""&&v!==null));
+          if(forcedSource==="Red Oak"||(!forcedSource&&detectClient("",file.name)==="Red Oak")){
+            const entries=parseRedOak(rawRows,rawHeaders);
+            if(!entries.length){setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"error",error:"No valid rows found in Excel file."}:q));continue;}
+            setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"ready",client:"Red Oak",entries}:q));
+            log("FILE_LOADED",file.name+" ("+entries.length+" entries)");continue;
+          }
+          const profileKey=forcedSource||(Object.keys(clientProfiles).find(cName=>clientProfiles[cName].filePatterns?.some(p=>file.name.toLowerCase().includes(p.toLowerCase())))||null);
+          if(profileKey&&clientProfiles[profileKey]){
+            const entries=applyGenericMap(rawRows,rawHeaders,clientProfiles[profileKey].fieldMap);
+            if(entries.length){
+              setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"ready",client:profileKey,entries}:q));
+              log("FILE_LOADED",file.name+" matched saved profile '"+profileKey+"' ("+entries.length+" entries)");continue;
+            }
+          }
+          setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"needs_mapping",rawHeaders,rawRows,client:forcedSource||""}:q));
+          setMappingForms(prev=>({...prev,[item.id]:{clientName:forcedSource||"",fieldMap:{name:"",regHours:"",otHours:"",perDiem:""},saveProfile:true}}));
+        }else{
+          setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"error",error:"Unsupported file type. Use PDF, Excel (.xlsx), or CSV."}:q));
         }
-        setTab("import");
-        log("FILE_LOADED",file.name+" detected as "+client);
-      }else if(ext==="xlsx"||ext==="xls"){
-        const XLSX=await import("xlsx");
-        const buf=await file.arrayBuffer();
-        const wb=XLSX.read(buf,{type:"array"});
-        const ws=wb.Sheets[wb.SheetNames[0]];
-        const data=XLSX.utils.sheet_to_json(ws,{header:1,defval:""});
-        if(data.length<2){setParseErrors(["Excel file has no data rows."]);return;}
-        const headers=data[0].map(h=>String(h).trim());
-        const rows=data.slice(1).filter(r=>r.some(v=>v!==""&&v!==null));
-        const client=forcedSource||"Red Oak";
-        const entries=parseRedOak(rows,headers);
-        if(!entries.length){setParseErrors(["No valid rows found in Excel file."]);return;}
-        setImportPreview({type:"parsed",client,entries,fileName:file.name});
-        setTab("import");
-        log("FILE_LOADED",file.name+" ("+entries.length+" entries)");
-      }else{
-        setParseErrors(["Unsupported file type. Use PDF (King Aerospace / Bombardier) or XLSX (Red Oak)."]);
+      }catch(err){
+        setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"error",error:"Error reading file: "+err.message}:q));
       }
-    }catch(err){
-      setParseErrors(["Error reading file: "+err.message]);
     }
-  },[log]);
+  },[log,clientProfiles]);
 
-  const confirmImport=useCallback(()=>{
-    if(!importPreview)return;
-    const{entries,client}=importPreview;
+  const removeFromQueue=useCallback((id)=>{
+    setImportQueue(prev=>prev.filter(q=>q.id!==id));
+    setMappingForms(prev=>{const n={...prev};delete n[id];return n;});
+  },[]);
+
+  const applyMapping=useCallback((item)=>{
+    const form=mappingForms[item.id];
+    if(!form?.clientName?.trim()){alert("Please enter a client name.");return;}
+    const entries=applyGenericMap(item.rawRows,item.rawHeaders,form.fieldMap);
+    if(!entries.length){alert("No valid rows found. Make sure Employee Name and at least one hours column are selected.");return;}
+    if(form.saveProfile){
+      const pattern=item.fileName.replace(/\d+/g,"").replace(/\.(xlsx?|csv)$/i,"").trim();
+      setClientProfiles(prev=>({...prev,[form.clientName]:{fieldMap:form.fieldMap,filePatterns:[...new Set([...(prev[form.clientName]?.filePatterns||[]),pattern])]}}));
+    }
+    setImportQueue(prev=>prev.map(q=>q.id===item.id?{...q,status:"ready",client:form.clientName,entries}:q));
+    log("COLUMN_MAP",item.fileName+" mapped as '"+form.clientName+"' ("+entries.length+" entries)");
+  },[mappingForms,log]);
+
+  const confirmQueueItem=useCallback((item)=>{
+    if(!item||item.status!=="ready")return;
+    const{entries,client}=item;
     const newEntries=[],errors=[],newMaps={...nameMap};
     for(const entry of entries){
-      const isDup=timeEntries.some(te=>te.importedName===entry.name&&te.weekEnding===entry.weekEnding&&te.regHours===entry.regHours&&te.otHours===entry.otHours);
-      if(isDup){errors.push(entry.name+": already imported — skipped");continue;}
-      newEntries.push({
-        id:uid(),
-        weekEnding:entry.weekEnding||config.weekEnding,
-        source:client,
-        importedName:entry.name,
-        regHours:entry.regHours||0,
-        otHours:entry.otHours||0,
-        dtHours:entry.dtHours||0,
-        perDiem:entry.perDiem||0,
-        payRate:0,
-        billREG:entry.billREG||0,
-        billOT:entry.billOT||0,
-        invoiceAmount:entry.invoiceAmount||0,
-        invoiceNumber:entry.invoiceNumber||"",
-        daysWorked:entry.daysWorked||0,
-        status:entry.status||"complete",
-        workerId:"",department:"",jobTitle:"",client:"",
-      });
+      const isDup=timeEntries.some(te=>te.importedName===entry.name&&te.weekEnding===(entry.weekEnding||config.weekEnding)&&te.regHours===entry.regHours&&te.otHours===entry.otHours);
+      if(isDup){errors.push(entry.name+": already imported \u2014 skipped");continue;}
+      newEntries.push({id:uid(),weekEnding:entry.weekEnding||config.weekEnding,source:client,importedName:entry.name,regHours:entry.regHours||0,otHours:entry.otHours||0,dtHours:entry.dtHours||0,perDiem:entry.perDiem||0,payRate:0,billREG:entry.billREG||0,billOT:entry.billOT||0,invoiceAmount:entry.invoiceAmount||0,invoiceNumber:entry.invoiceNumber||"",daysWorked:entry.daysWorked||0,status:entry.status||"complete",workerId:"",department:"",jobTitle:"",client:""});
       const exact=contractors.some(c=>c.name===entry.name);
-      if(!exact&&!newMaps.hasOwnProperty(entry.name)){
-        const f=fuzzyName(entry.name,contractors);
-        newMaps[entry.name]=f&&f.confidence>=75?f.match:"";
-      }
+      if(!exact&&!newMaps.hasOwnProperty(entry.name)){const f=fuzzyName(entry.name,contractors);newMaps[entry.name]=f&&f.confidence>=75?f.match:"";}
     }
     setTimeEntries(prev=>[...prev,...newEntries]);
-    setNameMap(newMaps);setParseErrors(errors);setImportPreview(null);
+    setNameMap(newMaps);
+    if(errors.length)setParseErrors(prev=>[...prev,...errors]);
+    removeFromQueue(item.id);
     log("IMPORT_CONFIRMED",client+": "+newEntries.length+" added, "+errors.length+" skipped");
-    if(errors.length===0)setTab("review");
-  },[importPreview,config.weekEnding,contractors,nameMap,timeEntries,log]);
+    if(errors.length===0&&newEntries.length>0)setTab("review");
+  },[nameMap,timeEntries,config.weekEnding,contractors,removeFromQueue,log]);
+
+  const confirmAllReady=useCallback(()=>{
+    const readyItems=importQueue.filter(q=>q.status==="ready");
+    if(!readyItems.length)return;
+    let allNew=[],allErrors=[],newMaps={...nameMap};
+    for(const item of readyItems){
+      for(const entry of item.entries){
+        const isDup=[...timeEntries,...allNew].some(te=>te.importedName===entry.name&&te.weekEnding===(entry.weekEnding||config.weekEnding)&&te.regHours===entry.regHours&&te.otHours===entry.otHours);
+        if(isDup){allErrors.push(entry.name+": already imported \u2014 skipped");continue;}
+        allNew.push({id:uid(),weekEnding:entry.weekEnding||config.weekEnding,source:item.client,importedName:entry.name,regHours:entry.regHours||0,otHours:entry.otHours||0,dtHours:entry.dtHours||0,perDiem:entry.perDiem||0,payRate:0,billREG:entry.billREG||0,billOT:entry.billOT||0,invoiceAmount:entry.invoiceAmount||0,invoiceNumber:entry.invoiceNumber||"",daysWorked:entry.daysWorked||0,status:entry.status||"complete",workerId:"",department:"",jobTitle:"",client:""});
+        const exact=contractors.some(c=>c.name===entry.name);
+        if(!exact&&!newMaps.hasOwnProperty(entry.name)){const f=fuzzyName(entry.name,contractors);newMaps[entry.name]=f&&f.confidence>=75?f.match:"";}
+      }
+    }
+    setTimeEntries(prev=>[...prev,...allNew]);
+    setNameMap(newMaps);
+    setParseErrors(allErrors);
+    setImportQueue(prev=>prev.filter(q=>q.status!=="ready"));
+    log("IMPORT_ALL",readyItems.length+" files, "+allNew.length+" entries added");
+    if(allErrors.length===0)setTab("review");
+  },[importQueue,nameMap,timeEntries,config.weekEnding,contractors,log]);
 
   const normalized=useMemo(()=>timeEntries.map(e=>{
     const stdName=nameMap[e.importedName]||e.importedName;
@@ -376,35 +448,178 @@ export default function ADGPayrollDashboard(){
   // ═══ IMPORT ═══
   const renderImport=()=>{
     const needsHours=weekEntries.filter(e=>e.status==="needs_hours");
+    const readyCount=importQueue.filter(q=>q.status==="ready").length;
+    const mappingCount=importQueue.filter(q=>q.status==="needs_mapping").length;
+    const selectStyle={background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:4,padding:"6px 10px",color:C.text,fontSize:12,width:"100%"};
+
     return(<div style={{display:"flex",flexDirection:"column",gap:20}}>
-    {/* Client upload cards */}
-    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))",gap:16}}>
-      {/* King Aerospace */}
-      <label style={{background:C.surface,border:"2px dashed "+C.border,borderRadius:12,padding:28,textAlign:"center",cursor:"pointer",display:"block"}}>
-        <div style={{fontSize:28,marginBottom:8}}>🛩️</div>
-        <div style={{fontWeight:700,color:C.accent,marginBottom:4,fontSize:14}}>King Aerospace</div>
-        <div style={{fontSize:11,color:C.textMuted,marginBottom:12}}>Upload PDF timecard</div>
-        <div style={{background:C.accentDim,color:C.accentBright,padding:"8px 16px",borderRadius:6,fontSize:12,fontWeight:600}}>Browse PDF</div>
-        <input type="file" accept=".pdf" style={{display:"none"}} onChange={e=>handleFileSelect(e,"King Aerospace")} />
-      </label>
-      {/* Bombardier Hartford */}
-      <label style={{background:C.surface,border:"2px dashed "+C.border,borderRadius:12,padding:28,textAlign:"center",cursor:"pointer",display:"block"}}>
-        <div style={{fontSize:28,marginBottom:8}}>✈️</div>
-        <div style={{fontWeight:700,color:C.info,marginBottom:4,fontSize:14}}>Bombardier Hartford</div>
-        <div style={{fontSize:11,color:C.textMuted,marginBottom:12}}>Upload PDF invoice</div>
-        <div style={{background:C.infoDim,color:C.info,padding:"8px 16px",borderRadius:6,fontSize:12,fontWeight:600}}>Browse PDF</div>
-        <input type="file" accept=".pdf" style={{display:"none"}} onChange={e=>handleFileSelect(e,"Bombardier Hartford")} />
-      </label>
-      {/* Red Oak */}
-      <label style={{background:C.surface,border:"2px dashed "+C.border,borderRadius:12,padding:28,textAlign:"center",cursor:"pointer",display:"block"}}>
-        <div style={{fontSize:28,marginBottom:8}}>📊</div>
-        <div style={{fontWeight:700,color:C.warn,marginBottom:4,fontSize:14}}>Red Oak (Qarbon)</div>
-        <div style={{fontSize:11,color:C.textMuted,marginBottom:12}}>Upload Excel spreadsheet</div>
-        <div style={{background:C.warnDim,color:C.warn,padding:"8px 16px",borderRadius:6,fontSize:12,fontWeight:600}}>Browse Excel</div>
-        <input type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>handleFileSelect(e,"Red Oak")} />
-      </label>
-    </div>
-    {/* Bombardier hours-needed alert */}
+
+    {/* ── SMART DROPZONE ── */}
+    <label
+      style={{background:"linear-gradient(135deg,"+C.surface+","+C.surfaceAlt+")",border:"2px dashed "+C.accent,borderRadius:16,padding:"36px 28px",textAlign:"center",cursor:"pointer",display:"block",transition:"all 0.2s"}}
+      onDragOver={e=>{e.preventDefault();e.currentTarget.style.borderColor=C.accentBright;e.currentTarget.style.background=C.accentDim+"33";}}
+      onDragLeave={e=>{e.currentTarget.style.borderColor=C.accent;e.currentTarget.style.background="linear-gradient(135deg,"+C.surface+","+C.surfaceAlt+")";}}
+      onDrop={e=>{e.preventDefault();e.currentTarget.style.borderColor=C.accent;e.currentTarget.style.background="linear-gradient(135deg,"+C.surface+","+C.surfaceAlt+")";handleFilesSelect(e.dataTransfer.files);}}
+    >
+      <div style={{fontSize:36,marginBottom:8}}>📂</div>
+      <div style={{fontWeight:700,color:C.accent,fontSize:16,marginBottom:4}}>Smart Upload — Drop Files Here</div>
+      <div style={{fontSize:12,color:C.textDim,marginBottom:14}}>Drop multiple PDF, Excel, or CSV files at once. The system auto-detects clients.</div>
+      <div style={{display:"inline-block",background:C.accent,color:"#000",padding:"10px 28px",borderRadius:8,fontSize:13,fontWeight:700}}>Browse Files</div>
+      <input type="file" accept=".pdf,.xlsx,.xls,.csv" multiple style={{display:"none"}} onChange={e=>handleFilesSelect(e)} />
+    </label>
+
+    {/* ── UPLOAD QUEUE ── */}
+    {importQueue.length>0&&(<div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:12,padding:20}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+        <div>
+          <h3 style={{margin:0,color:C.accent,fontSize:14}}>Upload Queue ({importQueue.length} file{importQueue.length!==1?"s":""})</h3>
+          <p style={{margin:"4px 0 0",fontSize:11,color:C.textMuted}}>{readyCount} ready · {mappingCount} need mapping</p>
+        </div>
+        {readyCount>0&&<button onClick={confirmAllReady} style={{...baseBtn,padding:"10px 24px",background:C.accent,color:"#000",fontSize:13,fontWeight:700}}>✓ Import All Ready ({readyCount})</button>}
+      </div>
+      {importQueue.map(item=>(
+        <div key={item.id} style={{background:item.status==="error"?C.dangerDim+"22":item.status==="needs_mapping"?C.warnDim+"22":item.status==="ready"?C.accentDim+"22":"transparent",border:"1px solid "+(item.status==="error"?C.danger:item.status==="needs_mapping"?C.warn:item.status==="ready"?C.accent:C.border),borderRadius:8,padding:14,marginBottom:10}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10,flex:1,minWidth:200}}>
+              <span style={{fontSize:18}}>{item.status==="ready"?"✅":item.status==="error"?"❌":item.status==="needs_mapping"?"🔧":item.status==="parsing"?"⏳":"📄"}</span>
+              <div>
+                <div style={{fontWeight:600,fontSize:13,color:C.text}}>{item.fileName}</div>
+                <div style={{fontSize:11,color:C.textMuted}}>
+                  {item.status==="ready"&&<span style={{color:C.accent}}>{item.client} — {item.entries.length} entries ready</span>}
+                  {item.status==="error"&&<span style={{color:C.danger}}>{item.error}</span>}
+                  {item.status==="needs_mapping"&&<span style={{color:C.warn}}>Unknown format — map columns below</span>}
+                  {item.status==="parsing"&&<span>Processing...</span>}
+                </div>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              {item.status==="ready"&&<button onClick={()=>confirmQueueItem(item)} style={{...baseBtn,padding:"6px 16px",background:C.accent,color:"#000",fontSize:12}}>✓ Import</button>}
+              <button onClick={()=>removeFromQueue(item.id)} style={{...baseBtn,padding:"6px 10px",background:"transparent",color:C.danger,fontSize:14}}>✕</button>
+            </div>
+          </div>
+
+          {/* ── COLUMN MAPPER (inline for needs_mapping items) ── */}
+          {item.status==="needs_mapping"&&mappingForms[item.id]&&(
+            <div style={{marginTop:14,paddingTop:14,borderTop:"1px solid "+C.border}}>
+              <div style={{fontWeight:700,color:C.warn,fontSize:12,marginBottom:10}}>🔧 Map Columns for This File</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+                <div>
+                  <label style={{fontSize:10,color:C.textMuted,textTransform:"uppercase",letterSpacing:1,display:"block",marginBottom:3}}>Client Name *</label>
+                  <input value={mappingForms[item.id].clientName} onChange={ev=>setMappingForms(p=>({...p,[item.id]:{...p[item.id],clientName:ev.target.value}}))} placeholder="e.g. Boeing, Gulfstream" style={{...selectStyle,border:"1px solid "+(mappingForms[item.id].clientName?"#243044":C.danger)}} />
+                </div>
+                <div>
+                  <label style={{fontSize:10,color:C.textMuted,textTransform:"uppercase",letterSpacing:1,display:"block",marginBottom:3}}>Employee Name Column *</label>
+                  <select value={mappingForms[item.id].fieldMap.name} onChange={ev=>setMappingForms(p=>({...p,[item.id]:{...p[item.id],fieldMap:{...p[item.id].fieldMap,name:ev.target.value}}}))} style={selectStyle}>
+                    <option value="">— Select —</option>
+                    {item.rawHeaders.map(h=><option key={h} value={h}>{h}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label style={{fontSize:10,color:C.textMuted,textTransform:"uppercase",letterSpacing:1,display:"block",marginBottom:3}}>REG Hours Column *</label>
+                  <select value={mappingForms[item.id].fieldMap.regHours} onChange={ev=>setMappingForms(p=>({...p,[item.id]:{...p[item.id],fieldMap:{...p[item.id].fieldMap,regHours:ev.target.value}}}))} style={selectStyle}>
+                    <option value="">— Select —</option>
+                    {item.rawHeaders.map(h=><option key={h} value={h}>{h}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label style={{fontSize:10,color:C.textMuted,textTransform:"uppercase",letterSpacing:1,display:"block",marginBottom:3}}>OT Hours Column</label>
+                  <select value={mappingForms[item.id].fieldMap.otHours} onChange={ev=>setMappingForms(p=>({...p,[item.id]:{...p[item.id],fieldMap:{...p[item.id].fieldMap,otHours:ev.target.value}}}))} style={selectStyle}>
+                    <option value="">— None —</option>
+                    {item.rawHeaders.map(h=><option key={h} value={h}>{h}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label style={{fontSize:10,color:C.textMuted,textTransform:"uppercase",letterSpacing:1,display:"block",marginBottom:3}}>Per Diem Column</label>
+                  <select value={mappingForms[item.id].fieldMap.perDiem} onChange={ev=>setMappingForms(p=>({...p,[item.id]:{...p[item.id],fieldMap:{...p[item.id].fieldMap,perDiem:ev.target.value}}}))} style={selectStyle}>
+                    <option value="">— None —</option>
+                    {item.rawHeaders.map(h=><option key={h} value={h}>{h}</option>)}
+                  </select>
+                </div>
+                <div style={{display:"flex",alignItems:"end",gap:8}}>
+                  <label style={{display:"flex",alignItems:"center",gap:6,fontSize:11,color:C.textDim,cursor:"pointer"}}>
+                    <input type="checkbox" checked={mappingForms[item.id].saveProfile} onChange={ev=>setMappingForms(p=>({...p,[item.id]:{...p[item.id],saveProfile:ev.target.checked}}))} />
+                    Remember for next time
+                  </label>
+                </div>
+              </div>
+              {item.rawHeaders.length>0&&(
+                <div style={{marginBottom:12}}>
+                  <div style={{fontSize:10,color:C.textMuted,textTransform:"uppercase",letterSpacing:1,marginBottom:4}}>Preview (first 3 rows)</div>
+                  <div style={{overflow:"auto",maxHeight:120,background:C.bg,borderRadius:6,padding:8}}>
+                    <table style={{...tableStyle,fontSize:10}}><thead><tr>{item.rawHeaders.map(h=><th key={h} style={{...thStyle,fontSize:9,padding:"4px 6px"}}>{h}</th>)}</tr></thead>
+                    <tbody>{item.rawRows.slice(0,3).map((r,ri)=><tr key={ri}>{r.map((v,vi)=><td key={vi} style={{...tdStyle,padding:"3px 6px",fontSize:10}}>{String(v??"")}</td>)}</tr>)}</tbody></table>
+                  </div>
+                </div>
+              )}
+              <button onClick={()=>applyMapping(item)} style={{...baseBtn,padding:"8px 20px",background:C.accent,color:"#000",fontSize:12,fontWeight:700}}>✓ Apply Mapping</button>
+            </div>
+          )}
+        </div>
+      ))}
+    </div>)}
+
+    {/* ── CLIENT CARDS ── */}
+    {(()=>{
+      const uploadedClients={};
+      weekEntries.forEach(e=>{const src=e.source||e.client||"";if(src)uploadedClients[src]=(uploadedClients[src]||0)+1;});
+      const cardStyle=(clr,name)=>{const has=uploadedClients[name];return{background:has?C.accentDim+"22":C.surface,border:"1px solid "+(has?C.accent:clr?clr+"44":C.border),borderRadius:10,padding:16,textAlign:"center",cursor:"pointer",display:"block",boxShadow:has?"0 0 12px "+C.accent+"44":"none",transition:"all 0.2s",position:"relative"};};
+      const uploadBadge=(name)=>{const count=uploadedClients[name];if(!count)return null;return <div style={{background:C.accent,color:"#000",fontSize:9,fontWeight:800,padding:"2px 8px",borderRadius:10,position:"absolute",top:6,right:6}}>✓ {count}</div>;};
+      return(
+      <div>
+        <div style={{fontSize:11,color:C.textMuted,textTransform:"uppercase",letterSpacing:1,marginBottom:10}}>Client Upload Cards ({3+Object.keys(clientProfiles).length})</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:12}}>
+          <label style={cardStyle(C.accent,"King Aerospace")}>
+            {uploadBadge("King Aerospace")}
+            <div style={{fontSize:22,marginBottom:4}}>🛩️</div>
+            <div style={{fontWeight:700,color:C.accent,fontSize:12}}>King Aerospace</div>
+            <div style={{fontSize:10,color:uploadedClients["King Aerospace"]?C.accent:C.textMuted}}>{uploadedClients["King Aerospace"]?"✓ Uploaded":"PDF timecard"}</div>
+            <input type="file" accept=".pdf" style={{display:"none"}} onChange={e=>handleFilesSelect(e,"King Aerospace")} />
+          </label>
+          <label style={cardStyle(C.info,"Bombardier Hartford")}>
+            {uploadBadge("Bombardier Hartford")}
+            <div style={{fontSize:22,marginBottom:4}}>✈️</div>
+            <div style={{fontWeight:700,color:C.info,fontSize:12}}>Bombardier Hartford</div>
+            <div style={{fontSize:10,color:uploadedClients["Bombardier Hartford"]?C.accent:C.textMuted}}>{uploadedClients["Bombardier Hartford"]?"✓ Uploaded":"PDF invoice"}</div>
+            <input type="file" accept=".pdf" style={{display:"none"}} onChange={e=>handleFilesSelect(e,"Bombardier Hartford")} />
+          </label>
+          <label style={cardStyle(C.warn,"Red Oak")}>
+            {uploadBadge("Red Oak")}
+            <div style={{fontSize:22,marginBottom:4}}>📊</div>
+            <div style={{fontWeight:700,color:C.warn,fontSize:12}}>Red Oak (Qarbon)</div>
+            <div style={{fontSize:10,color:uploadedClients["Red Oak"]?C.accent:C.textMuted}}>{uploadedClients["Red Oak"]?"✓ Uploaded":"Excel spreadsheet"}</div>
+            <input type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>handleFilesSelect(e,"Red Oak")} />
+          </label>
+          {/* Dynamic cards from saved client profiles */}
+          {Object.entries(clientProfiles).map(([name],idx)=>{
+            const colors=["#8b5cf6","#ec4899","#06b6d4","#f97316","#14b8a6","#a855f7","#eab308","#6366f1"];
+            const clr=colors[idx%colors.length];
+            return(
+            <label key={name} style={cardStyle(clr,name)}>
+              {uploadBadge(name)}
+              <div style={{fontSize:22,marginBottom:4}}>🏢</div>
+              <div style={{fontWeight:700,color:clr,fontSize:12}}>{name}</div>
+              <div style={{fontSize:10,color:uploadedClients[name]?C.accent:C.textMuted}}>{uploadedClients[name]?"✓ Uploaded":"Excel / CSV"}</div>
+              <input type="file" accept=".xlsx,.xls,.csv" style={{display:"none"}} onChange={e=>handleFilesSelect(e,name)} />
+            </label>);
+          })}
+        </div>
+      </div>);
+    })()}
+
+    {/* ── SAVED CLIENT PROFILES ── */}
+    {Object.keys(clientProfiles).length>0&&(
+      <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:16}}>
+        <div style={{fontWeight:700,color:C.accent,fontSize:13,marginBottom:10}}>💾 Saved Client Profiles</div>
+        <div style={{fontSize:11,color:C.textMuted,marginBottom:10}}>These client column mappings are remembered. Files matching these patterns are auto-processed.</div>
+        <table style={tableStyle}><thead><tr>{["Client Name","Name Col","REG Col","OT Col",""].map(h=><th key={h} style={{...thStyle,fontSize:9}}>{h}</th>)}</tr></thead>
+        <tbody>{Object.entries(clientProfiles).map(([name,prof])=>(
+          <tr key={name}><td style={{...tdStyle,fontWeight:600}}>{name}</td><td style={tdStyle}>{prof.fieldMap.name||"—"}</td><td style={tdStyle}>{prof.fieldMap.regHours||"—"}</td><td style={tdStyle}>{prof.fieldMap.otHours||"—"}</td>
+          <td style={tdStyle}><button onClick={()=>{if(window.confirm("Delete saved profile for '"+name+"'?"))setClientProfiles(p=>{const n={...p};delete n[name];return n;});}} style={{...baseBtn,padding:"3px 8px",background:"transparent",color:C.danger,fontSize:11}}>✕</button></td></tr>
+        ))}</tbody></table>
+      </div>
+    )}
+
+    {/* ── BOMBARDIER HOURS-NEEDED ALERT ── */}
     {needsHours.length>0&&(<div style={{background:C.warnDim,border:"1px solid "+C.warn,borderRadius:10,padding:20}}>
       <div style={{fontWeight:700,color:C.warn,fontSize:14,marginBottom:10}}>⚠️ {needsHours.length} Bombardier {needsHours.length===1?"Entry Needs":"Entries Need"} Hours</div>
       <p style={{fontSize:12,color:C.textDim,marginBottom:14}}>Bombardier's PDF doesn't include individual hours. Please fill in REG and OT hours for each worker below, then go to Review.</p>
@@ -424,35 +639,11 @@ export default function ADGPayrollDashboard(){
         </div>
       </div>))}
     </div>)}
-    {importPreview&&(<div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:20}}>
-      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-        <div>
-          <h3 style={{margin:0,color:C.accent,fontSize:14}}>{importPreview.client} — {importPreview.fileName}</h3>
-          <p style={{margin:"4px 0 0",fontSize:12,color:C.textMuted}}>{importPreview.entries.length} entr{importPreview.entries.length===1?"y":"ies"} ready to import</p>
-          {importPreview.invoiceAmount>0&&<p style={{margin:"4px 0 0",fontSize:12,color:C.warn}}>Invoice #{importPreview.invoiceNumber} — ${importPreview.invoiceAmount?.toLocaleString()}</p>}
-        </div>
-        <div style={{display:"flex",gap:8}}>
-          <button onClick={()=>setImportPreview(null)} style={{...baseBtn,padding:"8px 16px",background:C.surfaceAlt,color:C.textDim,fontSize:12}}>Cancel</button>
-          <button onClick={confirmImport} style={{...baseBtn,padding:"8px 20px",background:C.accent,color:"#000",fontSize:13}}>✓ Confirm Import</button>
-        </div>
-      </div>
-      <div style={{overflow:"auto",maxHeight:300}}>
-        <table style={tableStyle}><thead><tr>
-          {[["Worker Name","left"],["Week Ending","left"],["REG Hrs","right"],["OT Hrs","right"],["Bill REG","right"],["Status","left"]].map(([h,align])=><th key={h} style={{...thStyle,textAlign:align}}>{h}</th>)}
-        </tr></thead>
-        <tbody>{importPreview.entries.map((e,i)=>(
-          <tr key={i} style={{background:i%2===0?"transparent":C.surfaceAlt}}>
-            <td style={{...tdStyle,fontWeight:600}}>{e.name}</td>
-            <td style={tdStyle}>{e.weekEnding}</td>
-            <td style={{...tdStyle,textAlign:"right"}}>{e.regHours||0}</td>
-            <td style={{...tdStyle,textAlign:"right"}}>{e.otHours||0}</td>
-            <td style={{...tdStyle,textAlign:"right"}}>{e.billREG?"$"+e.billREG:"-"}</td>
-            <td style={tdStyle}>{e.status==="needs_hours"?<span style={{color:C.warn}}>⚠ Hours Needed</span>:<span style={{color:C.accent}}>✓ Ready</span>}</td>
-          </tr>
-        ))}</tbody></table>
-      </div>
-    </div>)}
+
+    {/* ── PARSE ERRORS ── */}
     {parseErrors.length>0&&(<div style={{background:C.surface,border:"1px solid "+C.warn,borderRadius:10,padding:16}}><h4 style={{margin:"0 0 8px",color:C.warn,fontSize:13}}>Import Notes ({parseErrors.length})</h4><div style={{maxHeight:200,overflow:"auto"}}>{parseErrors.map((e,i)=><div key={i} style={{fontSize:11,color:C.textDim,padding:"2px 0"}}>{e}</div>)}</div></div>)}
+
+    {/* ── QUICK ADD (MANUAL) ── */}
     <div style={{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:20}}>
       <h3 style={{margin:"0 0 14px",color:C.accent,fontSize:14}}>Quick Add (Manual)</h3>
       <div style={{display:"flex",gap:12,flexWrap:"wrap",alignItems:"end"}}>
@@ -668,7 +859,7 @@ export default function ADGPayrollDashboard(){
           <p style={{...S.p,marginBottom:20}}>Every pay period, follow these steps in order:</p>
           {[
             ["1","⚙️","Setup Tab — Set the pay period","Go to Setup. Set the Week Ending date (the last day of the pay week, usually a Friday). Confirm the Company ID matches your Paychex account. You only need to do this once per week."],
-            ["2","📥","Import Tab — Upload your client files","Click each of the 3 client cards and upload the file you received that week. King Aerospace → their PDF timecard. Bombardier Hartford → their PDF invoice. Red Oak (Qarbon) → their Excel spreadsheet. The system reads each file automatically."],
+            ["2","📥","Import Tab — Upload your client files","Drag and drop ALL your client files into the Smart Upload zone at once — PDFs, Excel, and CSV files. The system auto-detects King Aerospace, Bombardier, and Red Oak. For new clients, it will ask you to map columns once; after that, it remembers. You can also click individual client cards below the dropzone."],
             ["3","🔗","Names Tab — Match any new names","If the system doesn't recognize a name from a file (e.g. a new hire), the Names tab will show a badge with the count. Go there and match each imported name to the correct contractor from your roster."],
             ["4","✏️","Review Tab — Verify and correct","Check every row. Fill in any missing Worker IDs (required by Paychex). For Bombardier entries, enter the actual REG and OT hours — those aren't in their PDF. Fix any red errors before exporting."],
             ["5","✅","Export Tab — Download the Paychex file","Once the status dot in the top-right turns green, click 'Export Paychex SPI CSV'. Upload that file directly to Paychex to process payroll. Done!"]
@@ -705,9 +896,11 @@ export default function ADGPayrollDashboard(){
 
           <div style={{marginBottom:20}}>
             <div style={{fontWeight:700,color:C.accent,fontSize:13,marginBottom:8}}>📥 Import</div>
-            {[["King Aerospace card","Upload the KACC Weekly Timecard Detail PDF. The system reads each worker's REG, OT, and DT hours automatically."],
-              ["Bombardier Hartford card","Upload their invoice PDF. The system reads the invoice number and worker names, but hours must be entered manually in the Review tab."],
-              ["Red Oak (Qarbon) card","Upload their weekly Excel timesheet. Hours and bill rates are read automatically."],
+            {[["Smart Upload Dropzone","Drag and drop multiple files at once (PDF, Excel, CSV). The system auto-detects which client each file belongs to and queues them all for import."],
+              ["Upload Queue","Shows every file you dropped in with its status: ✅ Ready (auto-detected), 🔧 Needs Mapping (unknown client), or ❌ Error. Use 'Import All Ready' to confirm everything at once."],
+              ["Column Mapper","When the system doesn't recognize a file, it shows a mapper UI. Pick which columns are Employee Name, REG Hours, OT Hours, and Per Diem. Enter a client name and click Apply. Check 'Remember for next time' so you never have to do it again."],
+              ["Client Cards","The 3 built-in clients (King Aerospace, Bombardier, Red Oak) plus any custom clients you've configured. Click a card to upload a file pre-tagged to that client. New cards appear automatically when you save a mapping."],
+              ["Saved Client Profiles","Shows all your saved column mappings. The system uses these to auto-process files next week. You can delete a profile if it's no longer needed."],
               ["Quick Add (Manual)","Need to add an entry that wasn't in any file? Pick a contractor from the dropdown and type their hours here."],
               ["Import Notes","Yellow notes appear if the system had trouble reading part of a file. Non-critical — review them but don't panic."]].map(([f,d])=>(
               <div key={f} style={S.field}><span style={S.label}>{f}</span><span style={{...S.p,margin:0}}>{d}</span></div>))}
@@ -806,7 +999,7 @@ export default function ADGPayrollDashboard(){
           ["What's the difference between a Warning and an Error?","Errors (⛔ red) block the export — Paychex will reject the file if they're not fixed. Warnings (⚠ yellow) are flags for your review but don't block export. Example: a warning appears if REG hours exceed 40 (possible OT issue), but you can still export after you've reviewed it."],
           ["How do I handle a new contractor who isn't in the roster yet?","Go to Contractors tab → click '+ Add Contractor' → enter their name in Last, First format. Fill in their Pay and Bill rates. Add their Worker ID from Paychex. They'll appear in the Import dropdown immediately."],
           ["Can I use this on multiple computers?","Yes. After each payroll run, save a backup file (Setup → Save Backup to File) and store it in Teams. On the other computer, open the app → Setup → Load Backup from File. All your contractors, rates, and history will be restored."],
-          ["What if a client sends me a file in a new format?","Contact ACT. The parsers are built specifically for each client's current format. If they change their format, ACT can update the parser quickly."],
+          ["What if a client sends me a file in a new format?","No problem — you can handle it yourself! Drop the file into the Smart Upload zone. If the system doesn't recognize it, a Column Mapper will appear. Just tell it which column is the Employee Name and which is REG Hours, enter the client name, and check 'Remember for next time'. A new client card will appear on the Import tab, and the system will auto-process that client's files every week going forward."],
           ["Is my data secure?","Yes. All data stays on your computer in the browser. No payroll data is ever sent to any server or third party. The PDF parsing happens directly in your browser — the file never leaves your machine."]
         ].map(([q,a])=>(
           <div key={q} style={{marginBottom:16,paddingBottom:16,borderBottom:"1px solid "+C.border}}>
